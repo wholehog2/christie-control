@@ -19,8 +19,8 @@ jobs:
             extra: ""
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
@@ -28,7 +28,7 @@ jobs:
       - name: Zip de l'app macOS
         if: runner.os == 'macOS'
         run: ditto -c -k --keepParent dist/ChristieControl.app dist/ChristieControl-macos.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ChristieControl-${{ matrix.name }}
           path: |
