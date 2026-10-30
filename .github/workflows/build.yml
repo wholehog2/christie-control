@@ -13,10 +13,10 @@ jobs:
         include:
           - os: windows-latest
             name: windows
-            extra: --onefile
+            extra: --onefile --icon icon.ico
           - os: macos-15-intel
             name: macos-intel
-            extra: ""
+            extra: --icon icon.icns
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
