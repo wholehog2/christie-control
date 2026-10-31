@@ -69,7 +69,7 @@ class Projector:
         self.bind = None  # IP locale (carte réseau choisie) ou None = automatique
         self.lock = threading.Lock()  # une seule conversation TCP à la fois par VP
 
-    def ask(self, *cmds, timeout=3.0, idle=0.35, quiet=False):
+    def ask(self, *cmds, timeout=3.0, idle=0.35, quiet=False, want=1):
         """Envoie des commandes, renvoie la liste des messages reçus (sans parenthèses)."""
         with self.lock:
             s = socket.create_connection((self.ip, self.port), timeout=timeout,
@@ -87,7 +87,7 @@ class Projector:
                             break
                         buf += d.decode("latin-1")
                     except socket.timeout:
-                        if quiet or MSG.search(buf):  # quiet : pas d'accusé attendu (SET)
+                        if quiet or len(MSG.findall(buf)) >= want:  # quiet : pas d'accusé attendu (SET)
                             break
         return [m.strip() for m in MSG.findall(buf)]
 
@@ -99,7 +99,16 @@ class Projector:
     def source(self):  return _source(self._get("SIN+MAIN?", "SIN+MAIN"))
 
     def state(self):
-        d = dict(parse(self.ask("PWR?", "SHU?", "SIN+MAIN?")))
+        # want=3 : on attend les 3 réponses (le VP peut répondre lentement) ...
+        d = dict(parse(self.ask("PWR?", "SHU?", "SIN+MAIN?", want=3)))
+        for cmd, key in (("PWR?", "PWR"), ("SHU?", "SHU"), ("SIN+MAIN?", "SIN+MAIN")):
+            if key not in d:  # ... et on redemande individuellement celles qui manquent
+                try:
+                    v = self._get(cmd, key)
+                except OSError:
+                    v = None
+                if v is not None:
+                    d[key] = v
         return {"pwr": _power(d.get("PWR")), "shu": _shutter(d.get("SHU")),
                 "src": _source(d.get("SIN+MAIN"))}
 
