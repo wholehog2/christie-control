@@ -207,7 +207,18 @@ class RoundPower(QPushButton):
 
 CMDS = {("pwr", "on"): ("PWR 1", "power", 150), ("pwr", "off"): ("PWR 0", "power", 240),
         ("shu", "open"): ("SHU 0", "shutter", 8), ("shu", "closed"): ("SHU 1", "shutter", 8)}
-LOOKS = {"classic": "Classique (origine)", "console": "Console de régie", "tiles": "Tuiles", "side": "Barre latérale", "mixer": "Mixeur"}
+LOOKS = {
+    "classic": "Classique (origine)",
+    "console": "Console de régie",
+    "tiles": "Tuiles",
+    "side": "Barre latérale",
+    "mixer": "Mixeur",
+    "blue": "Moderne bleu",
+    "elegant": "Sombre élégant",
+    "light": "Clair moderne",
+    "industrial": "Industriel",
+    "color": "Tuiles & couleurs",
+}
 
 
 class Card(QFrame):
@@ -470,6 +481,91 @@ class Card(QFrame):
         self.lcd.setAlignment(Qt.AlignCenter)
         v.addWidget(self.lcd)
         v.addLayout(self.bar())
+
+    # --- cinq variantes graphiques supplémentaires ---
+    def skin(self, palette):
+        """Applique une identité visuelle locale sans modifier le thème global."""
+        palettes = {
+            "blue": {
+                "bg": "#0b1728", "card": "#142943", "panel": "#102238",
+                "text": "#edf6ff", "sub": "#9db8d2", "accent": "#08a9ff",
+                "border": "#24547b", "btn": "#1c3856", "hover": "#285078",
+            },
+            "elegant": {
+                "bg": "#111318", "card": "#191c22", "panel": "#101216",
+                "text": "#f0f1f4", "sub": "#a3a8b2", "accent": "#aeb8c7",
+                "border": "#353a44", "btn": "#252a33", "hover": "#343b47",
+            },
+            "light": {
+                "bg": "#e9eef7", "card": "#f8faff", "panel": "#edf3fc",
+                "text": "#17243a", "sub": "#65748b", "accent": "#0878e8",
+                "border": "#cbd8eb", "btn": "#e5edf9", "hover": "#d5e4f7",
+            },
+            "industrial": {
+                "bg": "#171717", "card": "#222222", "panel": "#191919",
+                "text": "#f4f1eb", "sub": "#aaa39a", "accent": "#ff9800",
+                "border": "#55402a", "btn": "#303030", "hover": "#414141",
+            },
+            "color": {
+                "bg": "#10172b", "card": "#18243d", "panel": "#152d43",
+                "text": "#f4f7ff", "sub": "#b9c7e8", "accent": "#25c7db",
+                "border": "#3d4d86", "btn": "#263b60", "hover": "#354d7c",
+            },
+        }
+        c = palettes[palette]
+        # La couleur des touches d'entrée est différenciée dans le look multicolore.
+        extra = """
+QPushButton[st="ok"] { background: #0878e8; color: white; border-color: #0878e8; }
+"""
+        if palette == "color":
+            extra += """
+QPushButton[st="ok"] { background: #13a85b; border-color: #13a85b; }
+QPushButton#pwr[st="ok"] { border-color: #13c879; }
+QPushButton#fold { color: #75d8ee; }
+"""
+        elif palette == "industrial":
+            extra += "QPushButton#fold { color: #ffad32; }\n"
+        elif palette == "blue":
+            extra += "QPushButton#fold { color: #42c7ff; }\n"
+        self.setStyleSheet(f"""
+QWidget {{ background: transparent; color: {c['text']}; }}
+QFrame#card {{ background: {c['card']}; border: 1px solid {c['border']}; border-radius: 14px; }}
+QFrame#pane {{ background: {c['panel']}; border: 1px solid {c['border']}; border-radius: 11px; }}
+QLabel#title {{ color: {c['text']}; font-weight: 650; }}
+QLabel#sub, QLabel#cap {{ color: {c['sub']}; }}
+QPushButton {{ background: {c['btn']}; color: {c['text']}; border: 1px solid {c['border']}; border-radius: 8px; padding: 8px 12px; }}
+QPushButton:hover {{ background: {c['hover']}; }}
+QPushButton:pressed, QPushButton#accent {{ background: {c['accent']}; color: white; border-color: {c['accent']}; }}
+QPushButton#fold {{ background: transparent; border: none; color: {c['sub']}; font-weight: 650; text-align: left; padding: 3px 0; }}
+QPushButton#fold:hover {{ color: {c['text']}; }}
+QPushButton[st="ok"] {{ background: {c['accent']}; color: white; border-color: {c['accent']}; }}
+QPushButton[st="busy"] {{ border: 2px solid #f59e0b; }}
+QPushButton[st="err"] {{ border: 2px solid #ef4444; }}
+QPushButton#pwr {{ border: 4px solid {c['border']}; border-radius: 42px; }}
+QPushButton#pwr[st="ok"] {{ border-color: #22c55e; }}
+QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 8px; }}
+{extra}
+""")
+
+    def ui_blue(self):
+        self.ui_classic()
+        self.skin("blue")
+
+    def ui_elegant(self):
+        self.ui_classic()
+        self.skin("elegant")
+
+    def ui_light(self):
+        self.ui_classic()
+        self.skin("light")
+
+    def ui_industrial(self):
+        self.ui_classic()
+        self.skin("industrial")
+
+    def ui_color(self):
+        self.ui_classic()
+        self.skin("color")
 
     # --- actions et état ---
     def go(self, group, key):
