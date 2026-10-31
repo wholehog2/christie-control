@@ -1,9 +1,9 @@
 name: Build ChristieControl
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:        # bouton "Run workflow" dans l'onglet Actions
   push:
-    tags: ["v*"]
+    tags: ["v*"]            # ou : git tag v1.0 && git push --tags
 
 jobs:
   build:
@@ -14,9 +14,15 @@ jobs:
           - os: windows-latest
             name: windows
             extra: --onefile --icon icon.ico
-          - os: macos-15-intel
+            out: dist/ChristieControl.exe
+          - os: macos-latest        # Apple Silicon (M1/M2/M3...)
+            name: macos-apple-silicon
+            extra: --icon icon.icns
+            out: dist/ChristieControl-macos-apple-silicon.zip
+          - os: macos-15-intel      # Mac Intel (MacBook Pro 2017...)
             name: macos-intel
             extra: --icon icon.icns
+            out: dist/ChristieControl-macos-intel.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
@@ -27,11 +33,9 @@ jobs:
       - run: pyinstaller --noconfirm --windowed --name ChristieControl ${{ matrix.extra }} app.py
       - name: Zip de l'app macOS
         if: runner.os == 'macOS'
-        run: ditto -c -k --keepParent dist/ChristieControl.app dist/ChristieControl-macos.zip
+        run: ditto -c -k --keepParent dist/ChristieControl.app ${{ matrix.out }}
       - uses: actions/upload-artifact@v6
         with:
           name: ChristieControl-${{ matrix.name }}
-          path: |
-            dist/ChristieControl.exe
-            dist/ChristieControl-macos.zip
+          path: ${{ matrix.out }}
           if-no-files-found: error
