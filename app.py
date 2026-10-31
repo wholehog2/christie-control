@@ -792,6 +792,22 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
 
     def show_info(self, rows, err):
         rows = [("Erreur", str(err))] if err else rows
+
+        # Les réponses d'information Christie contiennent parfois le code de
+        # paramètre sur trois chiffres, puis la valeur et enfin son libellé.
+        # Présenter le libellé dans la colonne de gauche et la valeur à droite.
+        # Exemple : "000 2090 Total Projector Hours" ->
+        #           "Total Projector Hours" | "2090"
+        formatted_rows = []
+        for key, value in rows:
+            match = re.match(r"^\s*\d{3}\s+(\S+)\s+(.+?)\s*$", str(value))
+            if match:
+                display_value, display_label = match.groups()
+                formatted_rows.append((display_label, display_value))
+            else:
+                formatted_rows.append((str(key), str(value)))
+        rows = formatted_rows
+
         if self.strip is not None:  # look Console : une ligne de données
             ok = [f"{k} : {v}" for k, v in rows if v != "non disponible"]
             self.strip.setText("   ·   ".join(ok[:5]) or "Aucune donnée disponible")
