@@ -219,6 +219,7 @@ class Card(QFrame):
         self.groups, self.pending, self.busy, self.info_loaded = {}, set(), False, False
         self.dot, self.dot_cb, self.lcd, self.strip = Led(), None, None, None
         self.folded = cfg["name"] in main.cfg.get("folded", [])
+        self.video_folded = cfg["name"] in main.cfg.get("video_folded", [])
         self.grid = QGridLayout()
         self.grid.setHorizontalSpacing(12)
         self.max_rows = {"classic": 99, "console": 3, "tiles": 4, "side": 99, "mixer": 0}[look]
@@ -296,26 +297,66 @@ class Card(QFrame):
         h.addWidget(b2)
         return h
 
-    def fold_header(self, title, body):
-        """Bouton ▾/▸ qui replie ou déplie le panneau de données (état mémorisé par VP)."""
+    def fold_header(self, title, body, kind="data"):
+        """Bouton ▾/▸ avec un état indépendant pour chaque panneau et chaque VP."""
         b = QPushButton()
         b.setObjectName("fold")
         b.setCursor(Qt.PointingHandCursor)
+        setting = "folded" if kind == "data" else "video_folded"
+
+        def is_folded():
+            return self.folded if kind == "data" else self.video_folded
 
         def paint():
-            b.setText(("▸ " if self.folded else "▾ ") + title)
-            body.setVisible(not self.folded)
+            folded = is_folded()
+            b.setText(("▸ " if folded else "▾ ") + title)
+            body.setVisible(not folded)
 
         def toggle():
-            self.folded = not self.folded
-            fl = set(self.main.cfg.get("folded", []))
-            (fl.add if self.folded else fl.discard)(self.cfg["name"])
-            self.main.cfg["folded"] = sorted(fl)
+            folded = not is_folded()
+            if kind == "data":
+                self.folded = folded
+            else:
+                self.video_folded = folded
+            states = set(self.main.cfg.get(setting, []))
+            (states.add if folded else states.discard)(self.cfg["name"])
+            self.main.cfg[setting] = sorted(states)
             self.main.save()
             paint()
+
         b.clicked.connect(toggle)
         paint()
         return b
+
+    def video_panel(self, items, cols=0, vertical=False, framed=False):
+        """Panneau Entrée vidéo repliable, commun aux cinq présentations."""
+        body = QWidget()
+        if cols:
+            layout = QGridLayout(body)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(8)
+            for i, item in enumerate(items):
+                layout.addWidget(item, i // cols, i % cols)
+        else:
+            layout = QVBoxLayout(body) if vertical else QHBoxLayout(body)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(6)
+            for item in items:
+                layout.addWidget(item)
+
+        panel = QWidget()
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+        v.addWidget(self.fold_header("Entrée vidéo", body, "video"))
+        v.addWidget(body)
+
+        if framed:
+            frame = QFrame()
+            frame.setObjectName("pane")
+            QVBoxLayout(frame).addWidget(panel)
+            return frame
+        return panel
 
     def info_col(self):
         v = QVBoxLayout()
@@ -339,8 +380,7 @@ class Card(QFrame):
         v.addLayout(self.title(17))
         for cap, items, cols in (
                 ("Alimentation", [self.F("pwr", "on", "Allumer"), self.F("pwr", "off", "Éteindre")], 0),
-                ("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")], 0),
-                ("Entrée vidéo", [self.F("src", i, INPUTS[i]) for i in self.ins], 3)):
+                ("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")], 0)):
             v.addWidget(self.cap(cap))
             if cols:
                 g = QGridLayout()
@@ -354,6 +394,7 @@ class Card(QFrame):
                 for w in items:
                     r.addWidget(w)
                 v.addLayout(r)
+        v.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3))
         v.addLayout(self.info_col())
 
     def ui_console(self):
@@ -368,7 +409,7 @@ class Card(QFrame):
         h.addWidget(ident)
         h.addWidget(self.grp("Alimentation", [self.F("pwr", "on", "Allumer"), self.F("pwr", "off", "Éteindre")]))
         h.addWidget(self.grp("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")]))
-        h.addWidget(self.grp("Entrée vidéo", [self.F("src", i, INPUTS[i]) for i in self.ins], cols=3))
+        h.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3))
         h.addStretch()
         h.addLayout(self.bar(vertical=True))
         v.addLayout(h)
@@ -390,7 +431,7 @@ class Card(QFrame):
         r.addWidget(self.round_power())
         r.addWidget(self.grp("Shutter", [self.S("shu", "open", "Ouvert"), self.S("shu", "closed", "Fermé")]), 1)
         v.addLayout(r)
-        v.addWidget(self.grp("Entrée vidéo", [self.S("src", i, INPUTS[i]) for i in self.ins], cols=3))
+        v.addWidget(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3))
         v.addLayout(self.info_col())
 
     def ui_side(self):
@@ -401,12 +442,13 @@ class Card(QFrame):
         r = QHBoxLayout()
         r.setSpacing(14)
         for g in (self.grp("Alimentation", [self.F("pwr", "on", "Allumer"), self.F("pwr", "off", "Éteindre")], vertical=True),
-                  self.grp("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")], vertical=True),
-                  self.grp("Entrée vidéo", [self.F("src", i, INPUTS[i]) for i in self.ins], cols=2)):
+                  self.grp("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")], vertical=True)):
             f = QFrame()
             f.setObjectName("pane")
             QVBoxLayout(f).addWidget(g)
             r.addWidget(f, 1)
+        r.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins],
+                                     cols=2, framed=True), 1)
         v.addLayout(r)
         v.addLayout(self.info_col(), 1)
 
@@ -420,9 +462,8 @@ class Card(QFrame):
         v.addWidget(self.cap("Shutter"))
         v.addWidget(self.S("shu", "open", "Ouvert"))
         v.addWidget(self.S("shu", "closed", "Fermé"))
-        v.addWidget(self.cap("Entrée vidéo"))
-        for i in self.ins:
-            v.addWidget(self.F("src", i, INPUTS[i]))
+        v.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins],
+                                     vertical=True))
         v.addStretch()
         self.lcd = QLabel("—")
         self.lcd.setObjectName("lcd")
