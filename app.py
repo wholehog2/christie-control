@@ -2,6 +2,7 @@ import json, re, sys, threading
 from pathlib import Path
 from PySide6.QtCore import QByteArray, QObject, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QPlainTextEdit,
@@ -21,6 +22,21 @@ def load():
         return {**DEFAULT, **json.loads(CFG.read_text("utf-8"))}
     except Exception:
         return json.loads(json.dumps(DEFAULT))
+
+
+def net_ifaces():
+    """Cartes réseau actives avec une adresse IPv4 : [(nom, ip)]."""
+    F = QNetworkInterface.InterfaceFlag
+    out = []
+    for i in QNetworkInterface.allInterfaces():
+        f = i.flags()
+        if not (f & F.IsUp and f & F.IsRunning) or f & F.IsLoopBack:
+            continue
+        ips = [e.ip().toString() for e in i.addressEntries()
+               if e.ip().protocol() == QAbstractSocket.NetworkLayerProtocol.IPv4Protocol]
+        if ips:
+            out.append((i.humanReadableName(), ips[0]))
+    return out
 
 
 def app_icon():
@@ -202,6 +218,7 @@ class Card(QFrame):
         self.p = Projector(cfg["ip"], cfg.get("port", PORT))
         self.groups, self.pending, self.busy, self.info_loaded = {}, set(), False, False
         self.dot, self.dot_cb, self.lcd, self.strip = Led(), None, None, None
+        self.folded = cfg["name"] in main.cfg.get("folded", [])
         self.grid = QGridLayout()
         self.grid.setHorizontalSpacing(12)
         self.max_rows = {"classic": 99, "console": 3, "tiles": 4, "side": 99, "mixer": 0}[look]
@@ -279,12 +296,38 @@ class Card(QFrame):
         h.addWidget(b2)
         return h
 
+    def fold_header(self, title, body):
+        """Bouton ▾/▸ qui replie ou déplie le panneau de données (état mémorisé par VP)."""
+        b = QPushButton()
+        b.setObjectName("fold")
+        b.setCursor(Qt.PointingHandCursor)
+
+        def paint():
+            b.setText(("▸ " if self.folded else "▾ ") + title)
+            body.setVisible(not self.folded)
+
+        def toggle():
+            self.folded = not self.folded
+            fl = set(self.main.cfg.get("folded", []))
+            (fl.add if self.folded else fl.discard)(self.cfg["name"])
+            self.main.cfg["folded"] = sorted(fl)
+            self.main.save()
+            paint()
+        b.clicked.connect(toggle)
+        paint()
+        return b
+
     def info_col(self):
         v = QVBoxLayout()
         v.setSpacing(6)
-        v.addWidget(self.cap("Données du projecteur"))
-        v.addLayout(self.grid)
-        v.addLayout(self.bar())
+        body = QWidget()
+        l = QVBoxLayout(body)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(6)
+        l.addLayout(self.grid)
+        l.addLayout(self.bar())
+        v.addWidget(self.fold_header("Données du projecteur", body))
+        v.addWidget(body)
         v.addStretch()
         return v
 
@@ -311,10 +354,7 @@ class Card(QFrame):
                 for w in items:
                     r.addWidget(w)
                 v.addLayout(r)
-        v.addWidget(self.cap("Données du projecteur"))
-        v.addLayout(self.grid)
-        v.addLayout(self.bar())
-        v.addStretch()
+        v.addLayout(self.info_col())
 
     def ui_console(self):
         v = QVBoxLayout(self)
@@ -335,7 +375,10 @@ class Card(QFrame):
         self.strip = QLabel("Données : …")
         self.strip.setObjectName("sub")
         self.strip.setWordWrap(True)
-        v.addWidget(self.strip)
+        row = QHBoxLayout()
+        row.addWidget(self.fold_header("Données", self.strip))
+        row.addWidget(self.strip, 1)
+        v.addLayout(row)
 
     def ui_tiles(self):
         v = QVBoxLayout(self)
@@ -495,6 +538,18 @@ class Settings(QDialog):
         f.addWidget(self.poll)
         f.addStretch()
         v.addLayout(f)
+        n = QHBoxLayout()
+        n.addWidget(QLabel("Carte réseau"))
+        self.iface = QComboBox()
+        self.iface.addItem("Automatique (choix du système)", "")
+        for name, ip in net_ifaces():
+            self.iface.addItem(f"{name} — {ip}", name)
+        cur = cfg.get("iface", "")
+        if cur and self.iface.findData(cur) < 0:
+            self.iface.addItem(f"{cur} (indisponible)", cur)
+        self.iface.setCurrentIndex(max(0, self.iface.findData(cur)))
+        n.addWidget(self.iface, 1)
+        v.addLayout(n)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept)
         bb.rejected.connect(self.reject)
@@ -543,7 +598,7 @@ class Main(QMainWindow):
         self.look.currentIndexChanged.connect(lambda _: self.set_look(self.look.currentData()))
         rf, st = QPushButton("Actualiser"), QPushButton("Paramètres")
         st.setObjectName("accent")
-        rf.clicked.connect(lambda: [c.refresh() for c in self.cards])
+        rf.clicked.connect(lambda: (self.sync_net(), [c.refresh() for c in self.cards]))
         st.clicked.connect(self.settings)
         for w in (t,):
             top.addWidget(w)
@@ -562,7 +617,7 @@ class Main(QMainWindow):
         self.msg.setObjectName("sub")
         v.addWidget(self.msg)
         self.timer = QTimer(self)
-        self.timer.timeout.connect(lambda: [c.refresh() for c in self.cards])
+        self.timer.timeout.connect(lambda: (self.sync_net(), [c.refresh() for c in self.cards]))
         self.set_theme(self.theme.currentText(), save=False)
         self.build()
 
@@ -574,6 +629,18 @@ class Main(QMainWindow):
 
     def save(self):
         CFG.write_text(json.dumps(self.cfg, indent=2, ensure_ascii=False), "utf-8")
+
+    def sync_net(self, announce=False):
+        """Applique la carte réseau choisie (adresse source des connexions TCP)."""
+        name, ip = self.cfg.get("iface", ""), None
+        if name:
+            ip = next((i for n, i in net_ifaces() if n == name), None)
+            if not ip:
+                self.msg.setText(f"Carte réseau « {name} » introuvable : réseau automatique")
+            elif announce:
+                self.msg.setText(f"Réseau : {name} ({ip})")
+        for c in self.cards:
+            c.p.bind = ip
 
     def set_look(self, key):
         self.cfg["look"] = key
@@ -625,6 +692,7 @@ class Main(QMainWindow):
         self.timer.stop()
         if self.cfg["poll"] > 0:
             self.timer.start(self.cfg["poll"] * 1000)
+        self.sync_net(True)
         for c in self.cards:
             c.refresh()
 
@@ -632,6 +700,7 @@ class Main(QMainWindow):
         d = Settings(self.cfg, self)
         if d.exec():
             self.cfg["projectors"], self.cfg["poll"] = d.projectors(), d.poll.value()
+            self.cfg["iface"] = d.iface.currentData()
             self.save()
             self.build()
 

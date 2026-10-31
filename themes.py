@@ -25,6 +25,8 @@ QComboBox QAbstractItemView{{background:{t['card']};color:{t['text']};selection-
 QHeaderView::section{{background:{t['btn']};color:{t['text']};border:none;padding:6px}}
 QTableWidget{{gridline-color:{t['border']}}}
 QScrollArea{{border:none}}
+QPushButton#fold{{background:transparent;border:none;color:{t['sub']};font-weight:600;text-align:left;padding:2px 0}}
+QPushButton#fold:hover{{color:{t['text']}}}
 QFrame#pane{{background:{t['bg']};border:1px solid {t['border']};border-radius:12px}}
 QPushButton[st="ok"]{{background:{t['accent']};color:white;border-color:{t['accent']}}}
 QPushButton[st="busy"]{{border-color:#f59e0b}}

@@ -66,12 +66,14 @@ def _source(v):
 class Projector:
     def __init__(self, ip, port=PORT):
         self.ip, self.port = ip, int(port)
+        self.bind = None  # IP locale (carte réseau choisie) ou None = automatique
         self.lock = threading.Lock()  # une seule conversation TCP à la fois par VP
 
     def ask(self, *cmds, timeout=3.0, idle=0.35, quiet=False):
         """Envoie des commandes, renvoie la liste des messages reçus (sans parenthèses)."""
         with self.lock:
-            s = socket.create_connection((self.ip, self.port), timeout=timeout)
+            s = socket.create_connection((self.ip, self.port), timeout=timeout,
+                                         source_address=(self.bind, 0) if self.bind else None)
             with s:
                 for c in cmds:
                     s.sendall(f"({c})\n".encode())
