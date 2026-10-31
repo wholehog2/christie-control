@@ -25,6 +25,16 @@ QComboBox QAbstractItemView{{background:{t['card']};color:{t['text']};selection-
 QHeaderView::section{{background:{t['btn']};color:{t['text']};border:none;padding:6px}}
 QTableWidget{{gridline-color:{t['border']}}}
 QScrollArea{{border:none}}
+QFrame#pane{{background:{t['bg']};border:1px solid {t['border']};border-radius:12px}}
+QPushButton[st="ok"]{{background:{t['accent']};color:white;border-color:{t['accent']}}}
+QPushButton[st="busy"]{{border-color:#f59e0b}}
+QPushButton[st="err"]{{border-color:#ef4444}}
+QPushButton[sel="1"]{{background:{t['accent']};color:white}}
+QPushButton#pwr{{min-width:84px;max-width:84px;min-height:84px;max-height:84px;border:4px solid {t['border']};padding:0;border-radius:42px}}
+QPushButton#pwr[st="ok"]{{background:transparent;border-color:#22c55e}}
+QPushButton#pwr[st="busy"]{{background:transparent;border-color:#f59e0b}}
+QPushButton#pwr[st="err"]{{background:transparent;border-color:#ef4444}}
+QLabel#lcd{{font-family:Menlo,Consolas,monospace;font-size:18px;color:#4ade80;background:#0b140d;border-radius:8px;padding:8px}}
 QScrollBar:vertical{{width:10px;background:transparent}}
 QScrollBar::handle:vertical{{background:{t['border']};border-radius:5px;min-height:30px}}
 QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{{height:0}}
