@@ -216,6 +216,8 @@ LOOKS = {
     "blue": "Moderne bleu",
     "elegant": "Sombre élégant",
     "light": "Clair moderne",
+    "lightdark": "Clair moderne · sombre",
+    "lightmid": "Clair moderne · intermédiaire",
     "industrial": "Industriel",
     "color": "Tuiles & couleurs",
 }
@@ -501,6 +503,16 @@ class Card(QFrame):
                 "text": "#17243a", "sub": "#65748b", "accent": "#0878e8",
                 "border": "#cbd8eb", "btn": "#e5edf9", "hover": "#d5e4f7",
             },
+            "lightdark": {  # même identité que « light », en sombre
+                "bg": "#0d1524", "card": "#131f35", "panel": "#101a2d",
+                "text": "#e8f0fc", "sub": "#8fa3bf", "accent": "#0878e8",
+                "border": "#25395a", "btn": "#1a2a45", "hover": "#243a5c",
+            },
+            "lightmid": {  # luminosité intermédiaire entre « lightdark » et « light »
+                "bg": "#46577a", "card": "#566a8e", "panel": "#4e6084",
+                "text": "#f6f9ff", "sub": "#d3def2", "accent": "#0a74e0",
+                "border": "#7487ad", "btn": "#5b7098", "hover": "#6a80a8",
+            },
             "industrial": {
                 "bg": "#171717", "card": "#222222", "panel": "#191919",
                 "text": "#f4f1eb", "sub": "#aaa39a", "accent": "#ff9800",
@@ -618,7 +630,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         v.addWidget(info, 1)
         self.skin("elegant")
 
-    def ui_light(self):
+    def ui_light(self, palette="light"):
         """Style clair : tableau de bord en deux colonnes avec blocs bien séparés."""
         v = QVBoxLayout(self)
         v.setContentsMargins(22, 20, 22, 18)
@@ -653,7 +665,15 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         iv = QVBoxLayout(info)
         iv.addLayout(self.info_col())
         v.addWidget(info, 1)
-        self.skin("light")
+        self.skin(palette)
+
+    def ui_lightdark(self):
+        """Clair moderne en version sombre (même disposition)."""
+        self.ui_light("lightdark")
+
+    def ui_lightmid(self):
+        """Clair moderne en version intermédiaire (même disposition)."""
+        self.ui_light("lightmid")
 
     def ui_industrial(self):
         """Style industriel : pupitre technique, sections encadrées et commandes robustes."""
