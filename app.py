@@ -233,7 +233,7 @@ class Card(QFrame):
         self.video_folded = cfg["name"] in main.cfg.get("video_folded", [])
         self.grid = QGridLayout()
         self.grid.setHorizontalSpacing(12)
-        self.max_rows = {"classic": 99, "console": 3, "tiles": 4, "side": 99, "mixer": 0}[look]
+        self.max_rows = {"classic": 99, "console": 3, "tiles": 4, "side": 99, "mixer": 0}.get(look, 99)
         self.ins = [i for i in cfg.get("inputs", list(INPUTS)) if i in INPUTS]
         getattr(self, "ui_" + look)()
 
@@ -725,8 +725,9 @@ class Main(QMainWindow):
         t = QLabel("Projecteurs")
         t.setObjectName("title")
         self.theme = QComboBox()
-        self.theme.addItems(THEMES)
-        self.theme.setCurrentText(self.cfg["theme"] if self.cfg["theme"] in THEMES else "Sombre")
+        self.no_theme = "Sans thème"
+        self.theme.addItems([*THEMES, self.no_theme])
+        self.theme.setCurrentText(self.cfg["theme"] if self.cfg["theme"] in (*THEMES, self.no_theme) else "Sombre")
         self.theme.currentTextChanged.connect(self.set_theme)
         self.look = QComboBox()
         for k, n in LOOKS.items():
@@ -759,7 +760,13 @@ class Main(QMainWindow):
         self.build()
 
     def set_theme(self, name, save=True):
-        QApplication.instance().setStyleSheet(qss(THEMES[name]))
+        # « Sans thème » désactive le QSS global : les looks personnalisés
+        # conservent ainsi exactement leur propre palette et les widgets
+        # standards utilisent le style natif Fusion.
+        if name == getattr(self, "no_theme", "Sans thème"):
+            QApplication.instance().setStyleSheet("")
+        else:
+            QApplication.instance().setStyleSheet(qss(THEMES[name]))
         self.cfg["theme"] = name
         if save:
             self.save()
@@ -819,12 +826,19 @@ class Main(QMainWindow):
         else:
             g = QGridLayout(h)
             g.setSpacing(14)
+            positions = {"classic": (lambda n: (n // 2, n % 2)),
+                         "console": (lambda n: (n, 0)),
+                         "tiles": (lambda n: (n // 2, n % 2)),
+                         "mixer": (lambda n: (0, n))}
+            position = positions.get(look, positions["classic"])
             for n, c in enumerate(self.cards):
-                g.addWidget(c, *{"classic": (n // 2, n % 2), "console": (n, 0), "tiles": (n // 2, n % 2), "mixer": (0, n)}[look])
+                g.addWidget(c, *position(n))
             if look == "mixer":
                 g.setColumnStretch(len(self.cards), 1)
-            else:
+            elif look in ("classic", "tiles") or look not in ("console", "side"):
                 g.setRowStretch(len(self.cards) // 2 + 1, 1)
+            else:
+                g.setRowStretch(len(self.cards), 1)
         self.area.setWidget(h)
         self.timer.stop()
         if self.cfg["poll"] > 0:
