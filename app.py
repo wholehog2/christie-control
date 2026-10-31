@@ -1,4 +1,4 @@
-import json, re, sys, threading
+import base64, json, re, sys, threading
 from pathlib import Path
 from PySide6.QtCore import QByteArray, QObject, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
@@ -8,10 +8,10 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBo
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QPlainTextEdit,
                                QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
+from icon_data import ICON_PNG_B64
 from protocol import INPUTS, PORT, Projector, wait_for
 from themes import THEMES, qss
 
-ICON_SVG = '''<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100" height="100"><rect x="2" y="2" width="96" height="96" rx="22" fill="#0f1b33"/><polygon points="43,46 84,26 84,74 43,54" fill="#4f8cff" opacity=".4"/><rect x="14" y="40" width="24" height="20" rx="5" fill="#e6ecff"/><circle cx="38" cy="50" r="7" fill="#4f8cff"/><circle cx="22" cy="46" r="2.5" fill="#22c55e"/><rect x="84" y="24" width="4" height="52" rx="2" fill="#e6ecff"/></svg>'''
 CFG = Path.home() / ".christie_control.json"
 DEFAULT = {"theme": "Sombre", "poll": 5,
            "projectors": [{"name": "VP 1", "ip": "192.168.0.10", "port": PORT, "inputs": list(INPUTS)}]}
@@ -40,16 +40,9 @@ def net_ifaces():
 
 
 def app_icon():
-    r = QSvgRenderer(QByteArray(ICON_SVG.encode()))
-    ic = QIcon()
-    for s in (16, 32, 64, 128, 256, 512):
-        img = QImage(s, s, QImage.Format_ARGB32)
-        img.fill(0)
-        p = QPainter(img)
-        r.render(p)
-        p.end()
-        ic.addPixmap(QPixmap.fromImage(img))
-    return ic
+    pm = QPixmap()
+    pm.loadFromData(base64.b64decode(ICON_PNG_B64), "PNG")
+    return QIcon(pm)
 
 
 class Relay(QObject):
