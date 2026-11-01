@@ -1191,8 +1191,23 @@ class Main(QMainWindow):
         else:
             QApplication.instance().setStyleSheet(qss(THEMES[name]))
         self.cfg["theme"] = name
+        self.style_side()
         if save:
             self.save()
+
+    def style_side(self):
+        """Barre latérale : le VP sélectionné est mis en avant discrètement (voile gris + fine barre d'accent)."""
+        side = getattr(self, "side_frame", None)
+        if side is None:
+            return
+        t = THEMES.get(self.cfg.get("theme"))
+        acc = t["accent"] if t else "#4f8cff"
+        col = f"color:{t['text']};" if t else ""
+        try:
+            side.setStyleSheet('QPushButton[sel="1"]{background:rgba(127,127,127,0.22);' + col
+                               + f'border-left:3px solid {acc};font-weight:600}}')
+        except RuntimeError:  # widget déjà supprimé (changement de look)
+            self.side_frame = None
 
     def save(self):
         CFG.write_text(json.dumps(self.cfg, indent=2, ensure_ascii=False), "utf-8")
@@ -1219,6 +1234,7 @@ class Main(QMainWindow):
         if look not in LOOKS:  # look inconnu (réglages d'une autre version) : retour au classique
             look = "classic"
         self.cards = [Card(c, self.msg.setText, self, look) for c in self.cfg["projectors"]]
+        self.side_frame = None
         h = QWidget()
         if look == "side":
             lay = QHBoxLayout(h)
@@ -1227,6 +1243,8 @@ class Main(QMainWindow):
             side = QFrame()
             side.setObjectName("card")
             side.setFixedWidth(240)
+            self.side_frame = side
+            self.style_side()
             sv = QVBoxLayout(side)
             sv.setSpacing(6)
             stack, items = QStackedWidget(), []

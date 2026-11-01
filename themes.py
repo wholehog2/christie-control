@@ -31,7 +31,6 @@ QFrame#pane{{background:{t['bg']};border:1px solid {t['border']};border-radius:1
 QPushButton[st="ok"]{{background:{t['accent']};color:white;border-color:{t['accent']}}}
 QPushButton[st="busy"]{{border-color:#f59e0b}}
 QPushButton[st="err"]{{border-color:#ef4444}}
-QPushButton[sel="1"]{{background:{t['accent']};color:white}}
 QPushButton#pwr{{min-width:84px;max-width:84px;min-height:84px;max-height:84px;border:4px solid {t['border']};padding:0;border-radius:42px}}
 QPushButton#pwr[st="ok"]{{background:transparent;border-color:#22c55e}}
 QPushButton#pwr[st="busy"]{{background:transparent;border-color:#f59e0b}}
