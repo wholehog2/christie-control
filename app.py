@@ -1,7 +1,7 @@
 import base64, json, re, sys, threading
 from pathlib import Path
-from PySide6.QtCore import QByteArray, QObject, QSize, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPixmap
+from PySide6.QtCore import QByteArray, QObject, QPointF, QRectF, QSize, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout,
@@ -198,6 +198,79 @@ class RoundPower(QPushButton):
         repolish(self)
 
 
+def svg_icon(svg):
+    img = QImage(96, 96, QImage.Format_ARGB32)
+    img.fill(0)
+    p = QPainter(img)
+    QSvgRenderer(QByteArray(svg.encode())).render(p)
+    p.end()
+    return QIcon(QPixmap.fromImage(img))
+
+
+def ceiling_svg(c):  # projecteur suspendu au plafond, faisceau vers l'écran
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><g stroke="{c}" fill="none" stroke-width="3" '
+            f'stroke-linecap="round"><line x1="5" y1="6" x2="43" y2="6"/><line x1="24" y1="6" x2="24" y2="12"/>'
+            f'<line x1="6" y1="43" x2="42" y2="43"/></g><rect x="13" y="12" width="22" height="11" rx="3" fill="{c}"/>'
+            f'<polygon points="24,25 11,41 37,41" fill="{c}" opacity=".35"/></svg>')
+
+
+def rear_svg(c):  # projecteur derrière l'écran, spectateur de l'autre côté
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><g stroke="{c}" fill="none" stroke-width="3" '
+            f'stroke-linecap="round"><line x1="27" y1="5" x2="27" y2="43"/></g>'
+            f'<rect x="2" y="19" width="14" height="10" rx="3" fill="{c}"/>'
+            f'<polygon points="17,24 26,11 26,37" fill="{c}" opacity=".35"/>'
+            f'<ellipse cx="39" cy="24" rx="7" ry="4.5" fill="none" stroke="{c}" stroke-width="2.5"/>'
+            f'<circle cx="39" cy="24" r="2.2" fill="{c}"/></svg>')
+
+
+class OriPreview(QWidget):
+    """Mini-écran : la lettre F montre comment l'image est retournée (haut/bas, gauche/droite)."""
+    def __init__(self, compact=False):
+        super().__init__()
+        self.flip_v = self.flip_h = False
+        self.setFixedSize(*((84, 50) if compact else (140, 82)))
+
+    def set_flips(self, v, h):
+        self.flip_v, self.flip_h = v, h
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.setPen(QPen(QColor("#4f8cff"), 2))
+        p.setBrush(QColor("#0f1b33"))
+        p.drawRoundedRect(QRectF(2, 2, w - 4, h - 4), 8, 8)
+        p.translate(w / 2, h / 2)
+        p.scale(-1 if self.flip_h else 1, -1 if self.flip_v else 1)
+        f = QFont()
+        f.setBold(True)
+        f.setPixelSize(int(h * 0.62))
+        p.setFont(f)
+        p.setPen(QColor("#e6ecff"))
+        p.drawText(QRectF(-w / 2, -h / 2, w, h), Qt.AlignCenter, "F")
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("#22c55e"))  # repère du coin haut-gauche d'origine
+        p.drawEllipse(QPointF(-w / 2 + 13, -h / 2 + 13), 4, 4)
+
+
+class OrientBtn(Seg):
+    """Bouton à bascule avec pictogramme : gris = inactif, plein = actif, orange = en cours, rouge = échec."""
+    COL = {"ok": "#ffffff", "busy": "#f59e0b", "err": "#ef4444", "off": "#8b93a7"}
+
+    def __init__(self, text, svg_fn, cb, size):
+        super().__init__(text, cb)
+        self.svg_fn = svg_fn
+        self.setIconSize(QSize(size, size))
+        self.setMinimumHeight(size + 22)
+        self.set("off")
+
+    def set(self, st):
+        self.setIcon(svg_icon(self.svg_fn(self.COL[st])))
+        super().set(st)
+
+
+ORI = {"ceiling": ("CEL", "Au plafond"), "rear": ("SOR", "En rétro")}
 CMDS = {("pwr", "on"): ("PWR 1", "power", 150), ("pwr", "off"): ("PWR 0", "power", 240),
         ("shu", "open"): ("SHU 0", "shutter", 8), ("shu", "closed"): ("SHU 1", "shutter", 8)}
 LOOKS = {
@@ -225,11 +298,13 @@ class Card(QFrame):
         self.groups, self.pending, self.busy, self.info_loaded = {}, set(), False, False
         self.dot, self.dot_cb, self.lcd, self.strip = Led(), None, None, None
         self.folded = cfg["name"] in main.cfg.get("folded", [])
-        self.video_folded = cfg["name"] in main.cfg.get("video_folded", [])
+        self.video_folded = False  # automatique : replié quand la source est identifiée, déplié sinon
         self.grid = QGridLayout()
         self.grid.setHorizontalSpacing(12)
         self.max_rows = {"classic": 99, "console": 3, "tiles": 99, "side": 99, "mixer": 0}.get(look, 99)
         self.ins = [i for i in cfg.get("inputs", list(INPUTS)) if i in INPUTS]
+        self.src_key, self.src_label = None, None  # source identifiée par le VP (n° d'entrée) et son affichage
+        self.ori, self.ori_btn, self.ori_prev, self.ori_loaded = {"ceiling": None, "rear": None}, {}, None, False
         getattr(self, "ui_" + look)()
 
     # --- briques communes ---
@@ -317,6 +392,8 @@ class Card(QFrame):
             folded = is_folded()
             b.setText(("▸ " if folded else "▾ ") + title)
             body.setVisible(not folded)
+            if kind == "video":
+                self.update_src_label()
 
         def toggle():
             folded = not is_folded()
@@ -324,13 +401,16 @@ class Card(QFrame):
                 self.folded = folded
             else:
                 self.video_folded = folded
-            states = set(self.main.cfg.get(setting, []))
-            (states.add if folded else states.discard)(self.cfg["name"])
-            self.main.cfg[setting] = sorted(states)
-            self.main.save()
+            if kind == "data":  # le panneau vidéo, lui, est géré automatiquement (non mémorisé)
+                states = set(self.main.cfg.get(setting, []))
+                (states.add if folded else states.discard)(self.cfg["name"])
+                self.main.cfg[setting] = sorted(states)
+                self.main.save()
             paint()
 
         b.clicked.connect(toggle)
+        if kind == "video":
+            self.video_paint = paint
         paint()
         return b
 
@@ -354,7 +434,19 @@ class Card(QFrame):
         v = QVBoxLayout(panel)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(6)
-        v.addWidget(self.fold_header("Entrée vidéo", body, "video"))
+        self.src_label = QLabel()
+        self.src_label.setTextFormat(Qt.RichText)
+        self.src_label.setStyleSheet("font-size:20px")
+        self.src_label.setVisible(False)
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        head.addWidget(self.fold_header("Entrée vidéo", body, "video"))
+        if not vertical:  # source en grand à côté du titre (sous le titre dans les colonnes étroites)
+            head.addWidget(self.src_label)
+        head.addStretch()
+        v.addLayout(head)
+        if vertical:
+            v.addWidget(self.src_label)
         v.addWidget(body)
 
         if framed:
@@ -400,6 +492,7 @@ class Card(QFrame):
                 for w in items:
                     r.addWidget(w)
                 v.addLayout(r)
+        v.addWidget(self.ori_panel())
         v.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3))
         v.addLayout(self.info_col())
 
@@ -419,6 +512,7 @@ class Card(QFrame):
         h.addStretch()
         h.addLayout(self.bar(vertical=True))
         v.addLayout(h)
+        v.addWidget(self.ori_panel(compact=True))
         self.strip = QLabel("Données : …")
         self.strip.setObjectName("sub")
         self.strip.setWordWrap(True)
@@ -438,6 +532,7 @@ class Card(QFrame):
         r.addWidget(self.grp("Shutter", [self.S("shu", "open", "Ouvert"), self.S("shu", "closed", "Fermé")]), 1)
         v.addLayout(r)
         v.addWidget(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3))
+        v.addWidget(self.ori_panel())
         v.addLayout(self.info_col())
 
     def ui_side(self):
@@ -456,6 +551,7 @@ class Card(QFrame):
         r.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins],
                                      cols=2, framed=True), 1)
         v.addLayout(r)
+        v.addWidget(self.ori_panel(framed=True))
         v.addLayout(self.info_col(), 1)
 
     def ui_mixer(self):
@@ -468,6 +564,7 @@ class Card(QFrame):
         v.addWidget(self.cap("Shutter"))
         v.addWidget(self.S("shu", "open", "Ouvert"))
         v.addWidget(self.S("shu", "closed", "Fermé"))
+        v.addWidget(self.ori_panel(compact=True, vertical=True))
         v.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins],
                                      vertical=True))
         v.addStretch()
@@ -580,6 +677,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
 
         video = self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=4, framed=True)
         v.addWidget(video)
+        v.addWidget(self.ori_panel(framed=True))
         info = QFrame()
         info.setObjectName("pane")
         iv = QVBoxLayout(info)
@@ -609,6 +707,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         shutter.addWidget(self.F("shu", "closed", "Fermé"))
         h.addLayout(shutter, 1)
         v.addWidget(commands)
+        v.addWidget(self.ori_panel(framed=True))
 
         source = QFrame()
         source.setObjectName("pane")
@@ -652,6 +751,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         rv.addStretch()
         body.addWidget(right, 2)
         v.addLayout(body, 2)
+        v.addWidget(self.ori_panel(framed=True))
 
         info = QFrame()
         info.setObjectName("pane")
@@ -706,6 +806,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         iv.addWidget(self.cap("SÉLECTION DE SOURCE"))
         iv.addWidget(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3))
         v.addWidget(inputs)
+        v.addWidget(self.ori_panel(framed=True))
         data = QFrame()
         data.setObjectName("pane")
         dv = QVBoxLayout(data)
@@ -744,6 +845,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         srcv.addWidget(self.cap("SOURCES DISPONIBLES"))
         srcv.addWidget(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3))
         v.addWidget(source)
+        v.addWidget(self.ori_panel(framed=True))
         info = QFrame()
         info.setObjectName("pane")
         infov = QVBoxLayout(info)
@@ -763,6 +865,104 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         for k, f in self.groups[group].items():
             f.led.set(state if k == key else "off")
 
+    def update_src_label(self):
+        """Source identifiée + panneau replié : on l'affiche en grand à côté du titre."""
+        lab = self.src_label
+        if lab is None:
+            return
+        k = self.src_key
+        show = bool(self.video_folded and k in INPUTS)
+        if show:
+            lab.setText(f'<span style="color:#22c55e">●</span>&nbsp;<b>{INPUTS[k]}</b>')
+        lab.setVisible(show)
+
+    def set_video_folded(self, folded):
+        self.video_folded = folded
+        paint = getattr(self, "video_paint", None)
+        if paint:
+            paint()
+
+    def sync_video(self, key):
+        """key = source identifiée par le VP, ou None. Identifiée : panneau replié ; sinon : déplié."""
+        was = self.src_key
+        self.src_key = key if key in INPUTS else None
+        if self.src_key is None:
+            self.set_video_folded(False)
+        elif was is None:
+            self.set_video_folded(True)
+        else:
+            self.update_src_label()
+
+    # --- position du projecteur : au plafond / en rétro ---
+    def ori_panel(self, compact=False, vertical=False, framed=False):
+        size = 28 if compact else 40
+        self.ori_prev = OriPreview(compact)
+        b1 = OrientBtn("Au plafond\nImage à l'envers", ceiling_svg, lambda: self.toggle_ori("ceiling"), size)
+        b2 = OrientBtn("En rétro\nImage en miroir", rear_svg, lambda: self.toggle_ori("rear"), size)
+        b1.setToolTip("Montage au plafond : retourne l'image de haut en bas (commande CEL)")
+        b2.setToolTip("Rétroprojection : inverse l'image de gauche à droite (commande SOR)")
+        self.ori_btn = {"ceiling": b1, "rear": b2}
+        body = QWidget()
+        l = QVBoxLayout(body) if vertical else QHBoxLayout(body)
+        l.setContentsMargins(0, 0, 0, 0)
+        l.setSpacing(10)
+        l.addWidget(self.ori_prev, 0, Qt.AlignHCenter if vertical else Qt.AlignVCenter)
+        l.addWidget(b1, 1)
+        l.addWidget(b2, 1)
+        if not vertical:  # boutons de largeur raisonnable même dans les looks très larges
+            b1.setMaximumWidth(300)
+            b2.setMaximumWidth(300)
+            l.addStretch(1)
+        panel = QWidget()
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+        v.addWidget(self.cap("Position du projecteur"))
+        v.addWidget(body)
+        self.paint_ori()
+        if framed:
+            frame = QFrame()
+            frame.setObjectName("pane")
+            QVBoxLayout(frame).addWidget(panel)
+            return frame
+        return panel
+
+    def paint_ori(self):
+        if self.ori_prev:
+            self.ori_prev.set_flips(self.ori["ceiling"] is True, self.ori["rear"] is True)
+
+    def toggle_ori(self, key):
+        g = "ori_" + key
+        if g in self.pending:
+            return
+        code, label = ORI[key]
+        target = self.ori.get(key) is not True
+        cmd = f"{code} {1 if target else 0}"
+        self.pending.add(g)
+        self.ori_btn[key].set("busy")
+
+        def done(ok, err):
+            self.pending.discard(g)
+            good = bool(ok) and not err
+            if good:
+                self.ori[key] = target
+            self.ori_btn[key].set(("ok" if self.ori[key] else "off") if good else "err")
+            self.paint_ori()
+            self.status(f"{self.cfg['name']} · {label} {'activé' if target else 'désactivé'} : "
+                        + ("confirmé" if good else f"non confirmé ({err or 'pas de réponse du VP'})"))
+        bg(lambda: self.p.set_and_check(cmd, code, 1 if target else 0), done)
+
+    def apply_ori(self, d, err):
+        if err or not d:
+            return
+        for key, n in d.items():
+            if n is None:
+                continue  # le VP ne répond pas à cette lecture : on garde l'état connu
+            self.ori[key] = True if n == 1 else False if n == 0 else None  # 2 = automatique
+            if "ori_" + key not in self.pending and key in self.ori_btn:
+                self.ori_btn[key].set("ok" if self.ori[key] else "off")
+        self.paint_ori()
+
     def act(self, group, key, cmd, getter, timeout):
         if group in self.pending:
             return
@@ -777,10 +977,15 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             self.pending.discard(group)
             good = bool(ok) and not err
             self.led(group, key, "ok" if good else "err")
+            if group == "src" and good:
+                self.src_key = key
+                self.set_video_folded(True)
             self.status(f"{self.cfg['name']} · {cmd} : " + ("confirmé" if good else f"non confirmé ({err or 'délai dépassé'})"))
         bg(work, done)
 
-    def refresh(self):
+    def refresh(self, full=False):
+        if full:
+            self.ori_loaded = False  # relire aussi la position du VP
         if self.busy:
             return
         self.busy = True
@@ -796,6 +1001,11 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             if g in self.pending:
                 continue
             self.led(g, None if err else st[g], "ok")
+        if "src" not in self.pending:
+            self.sync_video(None if err else st.get("src"))
+        if not err and not self.ori_loaded:
+            self.ori_loaded = True
+            bg(self.p.orientation, self.apply_ori)
         if not err and not self.info_loaded:
             self.info_loaded = True
             self.load_info()
@@ -936,7 +1146,7 @@ class Main(QMainWindow):
         self.look.currentIndexChanged.connect(lambda _: self.set_look(self.look.currentData()))
         rf, st = QPushButton("Actualiser"), QPushButton("Paramètres")
         st.setObjectName("accent")
-        rf.clicked.connect(lambda: (self.sync_net(), [c.refresh() for c in self.cards]))
+        rf.clicked.connect(lambda: (self.sync_net(), [c.refresh(True) for c in self.cards]))
         st.clicked.connect(self.settings)
         for w in (t,):
             top.addWidget(w)

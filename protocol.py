@@ -112,6 +112,28 @@ class Projector:
         return {"pwr": _power(d.get("PWR")), "shu": _shutter(d.get("SHU")),
                 "src": _source(d.get("SIN+MAIN"))}
 
+    def _read_num(self, code):
+        try:
+            d = dict(parse(self.ask(code + "?", timeout=2.5)))
+        except OSError:
+            return None
+        n, _ = _num_name(d.get(code))
+        return n
+
+    def orientation(self):
+        """Orientation lue sur le VP si il sait répondre : 0 / 1 (2 = auto) ou None si illisible."""
+        return {"ceiling": self._read_num("CEL"), "rear": self._read_num("SOR")}
+
+    def set_and_check(self, cmd, code, value):
+        """Envoie cmd avec accusé complet (#), puis relit l'état s'il est lisible."""
+        msgs = self.ask("#" + cmd, timeout=4.0)
+        if any("ERR" in m for m in msgs):
+            return False
+        got = self._read_num(code)
+        if got in (0, 1):
+            return got == value
+        return bool(msgs)  # état illisible : on se fie à l'accusé de réception du VP
+
     def info(self):
         rows = []
         for cmd, label in INFO:
