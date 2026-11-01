@@ -1,27 +1,61 @@
-import base64, json, re, sys, threading
+import base64, ipaddress, json, os, re, shutil, sys, threading, time
 from pathlib import Path
 from PySide6.QtCore import QByteArray, QObject, QPointF, QRectF, QSize, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QPlainTextEdit,
                                QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QMenu, QMessageBox, QVBoxLayout, QWidget)
 from icon_data import ICON_PNG_B64
-from protocol import INPUTS, PORT, Projector, wait_for
+from protocol import INPUTS, LSE_TEXT, PORT, Projector, wait_for
 from themes import THEMES, qss
 
 CFG = Path.home() / ".christie_control.json"
-DEFAULT = {"theme": "Sombre", "poll": 5,
+BAK = CFG.with_name(CFG.name + ".bak")
+DEFAULT = {"theme": "Sombre", "poll": 5, "confirm_off": True, "stagger": 2,
            "projectors": [{"name": "VP 1", "ip": "192.168.0.10", "port": PORT, "inputs": list(INPUTS)}]}
+LOAD_WARNING = ""
 
 
 def load():
-    try:
-        return {**DEFAULT, **json.loads(CFG.read_text("utf-8"))}
-    except Exception:
-        return json.loads(json.dumps(DEFAULT))
+    """Lit les réglages. Fichier illisible : il est mis de côté (jamais écrasé), puis on tente la copie de sauvegarde."""
+    global LOAD_WARNING
+    LOAD_WARNING, moved = "", None
+    for path in (CFG, BAK):
+        if not path.exists():
+            continue
+        try:
+            cfg = {**json.loads(json.dumps(DEFAULT)), **json.loads(path.read_text("utf-8"))}
+        except Exception:
+            if path == CFG:
+                moved = CFG.with_name(f"{CFG.stem}.corrompu-{time.strftime('%Y%m%d-%H%M%S')}.json")
+                try:
+                    CFG.rename(moved)
+                except OSError:
+                    moved = None
+            continue
+        if path == BAK and moved:
+            LOAD_WARNING = (f"Le fichier de réglages était illisible : il a été mis de côté sous « {moved.name} » "
+                            "et la dernière sauvegarde a été rechargée.")
+        return cfg
+    if moved:
+        LOAD_WARNING = (f"Le fichier de réglages était illisible : il a été mis de côté sous « {moved.name} » "
+                        "et les réglages par défaut sont utilisés.")
+    return json.loads(json.dumps(DEFAULT))
+
+
+def save_cfg(cfg):
+    """Écriture atomique ; la version précédente est conservée dans le fichier .bak."""
+    tmp = CFG.with_name(CFG.name + ".tmp")
+    tmp.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), "utf-8")
+    if CFG.exists():
+        try:
+            shutil.copy2(CFG, BAK)
+        except OSError:
+            pass
+    os.replace(tmp, CFG)
 
 
 def net_ifaces():
@@ -114,6 +148,44 @@ class Func(QWidget):
         l.addWidget(self.btn, 1)
 
 
+def confirm(parent, title, text, ok="Oui"):
+    """Boîte de confirmation : « Annuler » est le choix par défaut."""
+    box = QMessageBox(QMessageBox.Warning, title, text, QMessageBox.NoButton, parent)
+    yes = box.addButton(ok, QMessageBox.AcceptRole)
+    no = box.addButton("Annuler", QMessageBox.RejectRole)
+    box.setDefaultButton(no)
+    box.exec()
+    return box.clickedButton() is yes
+
+
+# Commandes (écriture) pouvant faire perdre des réglages ou l'accès au projecteur
+DANGEROUS = {
+    "DEF": "remet TOUS les réglages du projecteur aux valeurs d'usine",
+    "NET": "modifie la configuration réseau : le projecteur peut devenir injoignable",
+    "NTW": "modifie la configuration réseau : le projecteur peut devenir injoignable",
+    "ADR": "change l'adresse du projecteur : il peut devenir injoignable",
+    "BAC": "restaure ou écrase les réglages depuis une sauvegarde",
+    "UID": "active un mode de service du projecteur",
+    "PCG": "modifie le code PIN du projecteur",
+    "PIV": "modifie le code PIN du projecteur",
+    "FCT": "modifie des paramètres d'usine",
+    "SPP": "change le chemin du port série",
+    "WRE": "réinitialise la correction géométrique (warp)",
+    "LCB": "recalibre l'optique motorisée",
+}
+
+
+def pretty(label, value):
+    """Met en forme une donnée : heures « 2 090 h », températures « 41 °C »."""
+    v = str(value).strip()
+    if re.fullmatch(r"\d+", v):
+        if re.search(r"hour|heure|\bhrs?\b", label, re.I):
+            return f"{int(v):,}".replace(",", " ") + " h"
+        if re.search(r"temp", label, re.I):
+            return v + " °C"
+    return v
+
+
 class Console(QDialog):
     def __init__(self, proj, name, parent):
         super().__init__(parent)
@@ -133,6 +205,12 @@ class Console(QDialog):
         c = self.inp.text().strip().strip("()")
         if not c:
             return
+        code = re.sub(r"^[#\s]+", "", c)[:3].upper()
+        if code in DANGEROUS and "?" not in c:  # garde-fou : seules les écritures sont filtrées
+            if not confirm(self, "Commande risquée", f"« {c} » {DANGEROUS[code]}.\n\nL'envoyer quand même ?", "Envoyer"):
+                self.inp.clear()
+                self.out.appendPlainText(f"⛔ ({c}) annulée")
+                return
         self.inp.clear()
         self.out.appendPlainText(f"→ ({c})")
         bg(lambda: self.p.ask(c, timeout=4),
@@ -297,7 +375,17 @@ class Card(QFrame):
         self.p = Projector(cfg["ip"], cfg.get("port", PORT))
         self.groups, self.pending, self.busy, self.info_loaded = {}, set(), False, False
         self.dot, self.dot_cb, self.lcd, self.strip = Led(), None, None, None
-        self.folded = cfg["name"] in main.cfg.get("folded", [])
+        self.key = f'{cfg["ip"]}:{cfg.get("port", PORT)}'  # identifiant stable : survit au renommage du VP
+        folded = main.cfg.get("folded", [])
+        self.folded = self.key in folded or cfg["name"] in folded
+        self.locked, self.lockables = False, []
+        self.fail, self.poll_n, self.sig, self.last_st, self.lse_text = 0, 0, None, None, ""
+        self.pwr_t0 = self.pwr_target = None
+        self.pwr_info = QLabel()
+        self.pwr_info.setStyleSheet("font-weight:600")
+        self.pwr_timer = QTimer(self)
+        self.pwr_timer.timeout.connect(self.refresh_info)
+        self.state_lbl = None
         self.video_folded = False  # automatique : replié quand la source est identifiée, déplié sinon
         self.grid = QGridLayout()
         self.grid.setHorizontalSpacing(12)
@@ -306,6 +394,7 @@ class Card(QFrame):
         self.src_key, self.src_label = None, None  # source identifiée par le VP (n° d'entrée) et son affichage
         self.ori, self.ori_btn, self.ori_prev, self.ori_loaded = {"ceiling": None, "rear": None}, {}, None, False
         getattr(self, "ui_" + look)()
+        self.set_locked(main.locked)
 
     # --- briques communes ---
     def cap(self, t):
@@ -315,6 +404,7 @@ class Card(QFrame):
 
     def reg(self, g, k, w):
         self.groups.setdefault(g, {})[k] = w
+        self.lockables.append(w)
         return w
 
     def F(self, g, k, t):
@@ -326,6 +416,7 @@ class Card(QFrame):
     def round_power(self):
         rp = RoundPower(lambda k: self.go("pwr", k))
         self.groups["pwr"] = {"on": rp.on, "off": rp.off}
+        self.lockables.append(rp)
         return rp
 
     def title(self, size, stacked=False):
@@ -342,7 +433,9 @@ class Card(QFrame):
             v = QVBoxLayout()
             v.addLayout(top)
             v.addWidget(ip)
+            v.addWidget(self.pwr_info)
             return v
+        top.addWidget(self.pwr_info)
         top.addStretch()
         top.addWidget(ip)
         return top
@@ -375,6 +468,7 @@ class Card(QFrame):
             h.addWidget(b1)
         b2 = QPushButton("Console")
         b2.clicked.connect(lambda: Console(self.p, self.cfg["name"], self.main).show())
+        self.lockables.append(b2)
         h.addWidget(b2)
         return h
 
@@ -403,7 +497,9 @@ class Card(QFrame):
                 self.video_folded = folded
             if kind == "data":  # le panneau vidéo, lui, est géré automatiquement (non mémorisé)
                 states = set(self.main.cfg.get(setting, []))
-                (states.add if folded else states.discard)(self.cfg["name"])
+                (states.add if folded else states.discard)(self.key)
+                if not folded:
+                    states.discard(self.cfg["name"])  # ancien format (clé = nom)
                 self.main.cfg[setting] = sorted(states)
                 self.main.save()
             paint()
@@ -712,7 +808,6 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         source = QFrame()
         source.setObjectName("pane")
         sv = QVBoxLayout(source)
-        sv.addWidget(self.cap("SOURCE VIDÉO"))
         sv.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], vertical=False))
         v.addWidget(source)
         info = QFrame()
@@ -746,7 +841,6 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         right = QFrame()
         right.setObjectName("pane")
         rv = QVBoxLayout(right)
-        rv.addWidget(self.cap("ENTRÉES VIDÉO"))
         rv.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=2))
         rv.addStretch()
         body.addWidget(right, 2)
@@ -795,15 +889,18 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         meter.setObjectName("pane")
         mv = QVBoxLayout(meter)
         mv.addWidget(self.cap("ÉTAT"))
-        mv.addWidget(QLabel("Contrôle de liaison"), 0, Qt.AlignHCenter)
-        mv.addWidget(QLabel("LED d'état dans l'en-tête"), 0, Qt.AlignHCenter)
+        self.state_lbl = QLabel()
+        self.state_lbl.setTextFormat(Qt.RichText)
+        self.state_lbl.setWordWrap(True)
+        mv.addWidget(self.state_lbl)
+        mv.addStretch()
+        self.update_state_lbl()
         top.addWidget(meter, 1)
         v.addLayout(top)
 
         inputs = QFrame()
         inputs.setObjectName("pane")
         iv = QVBoxLayout(inputs)
-        iv.addWidget(self.cap("SÉLECTION DE SOURCE"))
         iv.addWidget(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3))
         v.addWidget(inputs)
         v.addWidget(self.ori_panel(framed=True))
@@ -842,7 +939,6 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         source = QFrame()
         source.setObjectName("pane")
         srcv = QVBoxLayout(source)
-        srcv.addWidget(self.cap("SOURCES DISPONIBLES"))
         srcv.addWidget(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3))
         v.addWidget(source)
         v.addWidget(self.ori_panel(framed=True))
@@ -854,7 +950,15 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         self.skin("color")
 
     # --- actions et état ---
-    def go(self, group, key):
+    def go(self, group, key, ask=True):
+        if self.main.locked:
+            self.status("Interface verrouillée : déverrouille pour envoyer une commande")
+            return
+        if group == "pwr" and key == "off" and ask and self.main.cfg.get("confirm_off", True):
+            if not confirm(self.main, "Éteindre le projecteur",
+                           f"Éteindre « {self.cfg['name']} » ?\n\nL'extinction lance un refroidissement qui peut durer plusieurs minutes.",
+                           "Éteindre"):
+                return
         if group == "src":
             self.act(group, key, f"SIN+MAIN {key}", self.p.source, 10)
         else:
@@ -866,14 +970,20 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             f.led.set(state if k == key else "off")
 
     def update_src_label(self):
-        """Source identifiée + panneau replié : on l'affiche en grand à côté du titre."""
+        """Source identifiée : en grand à côté du titre quand le panneau est replié (ou dès que le signal manque)."""
         lab = self.src_label
         if lab is None:
             return
         k = self.src_key
-        show = bool(self.video_folded and k in INPUTS)
+        show = bool(k in INPUTS and (self.video_folded or self.sig is False))
         if show:
-            lab.setText(f'<span style="color:#22c55e">●</span>&nbsp;<b>{INPUTS[k]}</b>')
+            extra = ""
+            if isinstance(self.sig, tuple):
+                extra = f'&nbsp;&nbsp;<span style="font-size:13px;color:#8b93a7">{self.sig[0]}×{self.sig[1]}</span>'
+            elif self.sig is False:
+                extra = '&nbsp;&nbsp;<span style="font-size:13px;color:#f59e0b">pas de signal</span>'
+            dot = "#f59e0b" if self.sig is False else "#22c55e"
+            lab.setText(f'<span style="color:{dot}">●</span>&nbsp;<b>{INPUTS[k]}</b>{extra}')
         lab.setVisible(show)
 
     def set_video_folded(self, folded):
@@ -902,6 +1012,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         b1.setToolTip("Montage au plafond : retourne l'image de haut en bas (commande CEL)")
         b2.setToolTip("Rétroprojection : inverse l'image de gauche à droite (commande SOR)")
         self.ori_btn = {"ceiling": b1, "rear": b2}
+        self.lockables += [b1, b2]
         body = QWidget()
         l = QVBoxLayout(body) if vertical else QHBoxLayout(body)
         l.setContentsMargins(0, 0, 0, 0)
@@ -945,6 +1056,9 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             self.ori_prev.set_flips(self.ori["ceiling"] is True, self.ori["rear"] is True)
 
     def toggle_ori(self, key):
+        if self.main.locked:
+            self.status("Interface verrouillée : déverrouille pour envoyer une commande")
+            return
         g = "ori_" + key
         if g in self.pending:
             return
@@ -981,6 +1095,8 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             return
         self.pending.add(group)
         self.led(group, key, "busy")
+        if group == "pwr":
+            self.pwr_start(key)
 
         def work():
             self.p.ask(cmd, quiet=True)            # 1) on envoie
@@ -988,6 +1104,8 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
 
         def done(ok, err):
             self.pending.discard(group)
+            if group == "pwr":
+                self.pwr_stop()
             good = bool(ok) and not err
             self.led(group, key, "ok" if good else "err")
             if group == "src" and good:
@@ -999,6 +1117,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
     def refresh(self, full=False):
         if full:
             self.ori_loaded = False  # relire aussi la position du VP
+            self.load_info()         # et les données
         if self.busy:
             return
         self.busy = True
@@ -1010,18 +1129,110 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         self.dot.set(s)
         if self.dot_cb:
             self.dot_cb(s)
+        name = self.cfg["name"]
+        self.last_st = None if err else st
+        if err:
+            self.fail += 1
+            if self.fail == 2:  # deux échecs d'affilée : le VP est considéré hors ligne
+                self.main.set_alert("off:" + self.key, "err", f"{name} : hors ligne")
+        else:
+            if self.fail >= 2:
+                self.status(f"{name} : de nouveau en ligne")
+            self.fail = 0
+            self.main.clear_alert("off:" + self.key)
         for g in self.groups:
             if g in self.pending:
                 continue
             self.led(g, None if err else st[g], "ok")
         if "src" not in self.pending:
             self.sync_video(None if err else st.get("src"))
+        self.on_signal(None if err else st.get("sig"))
+        if not err and "pwr" not in self.pending:  # allumage / refroidissement lancé ailleurs (télécommande...)
+            if st["pwr"] == "busy":
+                if self.pwr_t0 is None:
+                    self.pwr_start(None)
+            elif self.pwr_t0 is not None:
+                self.pwr_stop()
+        self.refresh_info()
+        if not err:
+            self.poll_n += 1
+            if self.poll_n % 6 == 1:  # dernière erreur système : toutes les ~30 s
+                bg(self.p.last_error, self.apply_lse)
         if not err and not self.ori_loaded:
             self.ori_loaded = True
             bg(self.p.orientation, self.apply_ori)
         if not err and not self.info_loaded:
             self.info_loaded = True
             self.load_info()
+        self.update_state_lbl()
+
+    # --- compte à rebours, signal, erreurs, verrouillage ---
+    def pwr_start(self, target):
+        self.pwr_target, self.pwr_t0 = target, time.time()
+        self.pwr_timer.start(1000)
+        self.refresh_info()
+
+    def pwr_stop(self):
+        self.pwr_target = self.pwr_t0 = None
+        self.pwr_timer.stop()
+        self.refresh_info()
+
+    def refresh_info(self):
+        """Texte d'état à côté du nom : « Hors ligne » ou « Allumage… 1:10 »."""
+        if self.fail >= 2:
+            txt, col = "Hors ligne", "#ef4444"
+        elif self.pwr_t0 is not None:
+            sec = int(time.time() - self.pwr_t0)
+            word = {"on": "Allumage", "off": "Extinction"}.get(self.pwr_target, "Transition")
+            txt, col = f"{word}… {sec // 60}:{sec % 60:02d}", "#f59e0b"
+        else:
+            txt, col = "", ""
+        self.pwr_info.setText(txt)
+        self.pwr_info.setStyleSheet(f"font-weight:600;color:{col}" if col else "font-weight:600")
+
+    def on_signal(self, sig):
+        prev, self.sig = self.sig, sig
+        k = "sig:" + self.key
+        if sig is False and isinstance(prev, tuple):
+            self.main.set_alert(k, "warn", f"{self.cfg['name']} : signal perdu sur {INPUTS.get(self.src_key, 'la source')}")
+        elif isinstance(sig, tuple):
+            self.main.clear_alert(k)
+        self.update_src_label()
+
+    def apply_lse(self, res, err):
+        if err or res is None:
+            return
+        n, name = res
+        k = "lse:" + self.key
+        if not n:
+            self.lse_text = ""
+            self.main.clear_alert(k)
+        else:
+            self.lse_text = LSE_TEXT.get(n, name or f"code {n}")
+            self.main.set_alert(k, "warn", f"{self.cfg['name']} : dernière erreur système — {self.lse_text}")
+        self.update_state_lbl()
+
+    def update_state_lbl(self):
+        if self.state_lbl is None:
+            return
+        st = self.last_st
+        col = lambda c, t: f'<span style="color:{c}">{t}</span>'
+        if st is None and self.fail == 0:
+            link, pw, sig = "connexion…", "—", "—"
+        else:
+            off = st is None
+            link = col("#ef4444", "hors ligne") if off else col("#22c55e", "en ligne")
+            pw = "—" if off else {"on": "allumé", "off": "éteint", "busy": "en transition"}.get(st["pwr"], "—")
+            sig = f"{self.sig[0]}×{self.sig[1]}" if isinstance(self.sig, tuple) else (
+                col("#f59e0b", "pas de signal") if self.sig is False else "—")
+        err = col("#f59e0b", self.lse_text) if self.lse_text else "aucune"
+        self.state_lbl.setText(f"Liaison : <b>{link}</b><br>Alimentation : <b>{pw}</b><br>"
+                               f"Signal : <b>{sig}</b><br>Dernière erreur : <b>{err}</b>")
+
+    def set_locked(self, locked):
+        self.locked = locked
+        for w in self.lockables:
+            w.setEnabled(not locked)
 
     def load_info(self):
         bg(self.p.info, self.show_info)
@@ -1043,6 +1254,8 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             else:
                 formatted_rows.append((str(key), str(value)))
         rows = formatted_rows
+        if not err:  # masque les lignes sans donnée ; heures et températures mises en forme
+            rows = [(k, pretty(k, v)) for k, v in rows if v != "non disponible"] or [("Données", "aucune donnée")]
 
         if self.strip is not None:  # look Console : une ligne de données
             ok = [f"{k} : {v}" for k, v in rows if v != "non disponible"]
@@ -1066,20 +1279,43 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         self.grid.setColumnStretch(1, 1)
 
 
+class InputsCell(QWidget):
+    """Cases à cocher des entrées réellement câblées (avec leur nom)."""
+    def __init__(self, selected):
+        super().__init__()
+        l = QHBoxLayout(self)
+        l.setContentsMargins(6, 0, 6, 0)
+        l.setSpacing(8)
+        self.boxes = {}
+        for k, n in INPUTS.items():
+            cb = QCheckBox(n)
+            cb.setChecked(k in selected)
+            self.boxes[k] = cb
+            l.addWidget(cb)
+        l.addStretch()
+
+    def get(self):
+        return [k for k, cb in self.boxes.items() if cb.isChecked()]
+
+
 class Settings(QDialog):
     def __init__(self, cfg, parent):
         super().__init__(parent)
         self.setWindowTitle("Paramètres")
-        self.resize(680, 460)
+        self.resize(1160, 580)
         v = QVBoxLayout(self)
         v.addWidget(QLabel("Projecteurs"))
-        self.t = QTableWidget(0, 4)
-        self.t.setHorizontalHeaderLabels(["Nom", "Adresse IP", "Port", "Entrées (n°)"])
-        self.t.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.t = QTableWidget(0, 5)
+        self.t.setHorizontalHeaderLabels(["Nom", "Adresse IP", "Port", "Entrées réellement câblées", "Connexion"])
+        hh = self.t.horizontalHeader()
+        hh.setSectionResizeMode(3, QHeaderView.Stretch)
+        for c, w in ((0, 130), (1, 140), (2, 64), (4, 125)):
+            hh.setSectionResizeMode(c, QHeaderView.Fixed)
+            self.t.setColumnWidth(c, w)
         for p in cfg["projectors"]:
             self.add(p)
         v.addWidget(self.t)
-        hint = QLabel("Entrées : " + " · ".join(f"{k} = {n}" for k, n in INPUTS.items()) + "  (celles réellement câblées)")
+        hint = QLabel("Coche les entrées réellement câblées. « Tester » vérifie la connexion avec les réglages de la ligne.")
         hint.setObjectName("sub")
         v.addWidget(hint)
         h = QHBoxLayout()
@@ -1096,8 +1332,17 @@ class Settings(QDialog):
         self.poll.setRange(0, 300)
         self.poll.setValue(cfg["poll"])
         f.addWidget(self.poll)
+        f.addSpacing(30)
+        f.addWidget(QLabel("Décalage entre projecteurs pour « Tout allumer » (s)"))
+        self.stagger = QSpinBox()
+        self.stagger.setRange(0, 60)
+        self.stagger.setValue(cfg.get("stagger", 2))
+        f.addWidget(self.stagger)
         f.addStretch()
         v.addLayout(f)
+        self.confirm = QCheckBox("Demander confirmation avant d'éteindre un projecteur")
+        self.confirm.setChecked(cfg.get("confirm_off", True))
+        v.addWidget(self.confirm)
         n = QHBoxLayout()
         n.addWidget(QLabel("Carte réseau"))
         self.iface = QComboBox()
@@ -1115,22 +1360,88 @@ class Settings(QDialog):
         bb.rejected.connect(self.reject)
         v.addWidget(bb)
 
+    def cell(self, r, c):
+        it = self.t.item(r, c)
+        return (it.text() if it else "").strip()
+
     def add(self, p=None):
         r = self.t.rowCount()
         p = p or {"name": f"VP {r + 1}", "ip": "192.168.0.1", "port": PORT, "inputs": list(INPUTS)}
         self.t.insertRow(r)
-        for i, x in enumerate([p["name"], p["ip"], str(p.get("port", PORT)), ",".join(map(str, p.get("inputs", list(INPUTS))))]):
+        for i, x in enumerate([p["name"], p["ip"], str(p.get("port", PORT))]):
             self.t.setItem(r, i, QTableWidgetItem(x))
+        self.t.setCellWidget(r, 3, InputsCell(p.get("inputs", list(INPUTS))))
+        b = QPushButton("Tester")
+        b.clicked.connect(lambda _=False, b=b: self.test_row(b))
+        self.t.setCellWidget(r, 4, b)
+        self.t.setRowHeight(r, 44)
+
+    def bind_ip(self):
+        name = self.iface.currentData()
+        return next((i for n, i in net_ifaces() if n == name), None) if name else None
+
+    def test_row(self, btn):
+        """Teste la connexion avec les réglages de la ligne (adresse, port, carte réseau choisie)."""
+        r = next((i for i in range(self.t.rowCount()) if self.t.cellWidget(i, 4) is btn), None)
+        if r is None:
+            return
+        ip, port = self.cell(r, 1), self.cell(r, 2)
+        try:
+            ipaddress.ip_address(ip)
+        except ValueError:
+            btn.setText("IP invalide")
+            return
+        proj = Projector(ip, int(port) if port.isdigit() else PORT)
+        proj.bind = self.bind_ip()
+        btn.setEnabled(False)
+        btn.setText("Test…")
+
+        def done(st, err):
+            btn.setEnabled(True)
+            if err:
+                btn.setText("✗ Injoignable")
+                btn.setToolTip(str(err))
+            else:
+                btn.setText("✓ En ligne")
+                btn.setToolTip(f"Alimentation : {st['pwr']} · source : {INPUTS.get(st['src'], 'aucune')}")
+        bg(proj.state, done)
+
+    def accept(self):
+        errs, names, addrs = [], set(), set()
+        for r in range(self.t.rowCount()):
+            name, ip, port = self.cell(r, 0), self.cell(r, 1), self.cell(r, 2)
+            if not ip:
+                continue  # ligne vide : ignorée
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                errs.append(f"Ligne {r + 1} : adresse IP invalide (« {ip} »)")
+            if port and not (port.isdigit() and 1 <= int(port) <= 65535):
+                errs.append(f"Ligne {r + 1} : port invalide (« {port} », attendu de 1 à 65535)")
+            nm = name or f"VP {r + 1}"
+            if nm in names:
+                errs.append(f"Ligne {r + 1} : le nom « {nm} » est déjà utilisé")
+            names.add(nm)
+            ad = (ip, port or str(PORT))
+            if ad in addrs:
+                errs.append(f"Ligne {r + 1} : cette adresse est déjà utilisée par un autre projecteur")
+            addrs.add(ad)
+            if not self.t.cellWidget(r, 3).get():
+                errs.append(f"Ligne {r + 1} : coche au moins une entrée")
+        if errs:
+            QMessageBox.warning(self, "Réglages invalides", "\n".join(errs))
+            return
+        super().accept()
 
     def projectors(self):
         out = []
         for r in range(self.t.rowCount()):
-            g = lambda c: (self.t.item(r, c).text() if self.t.item(r, c) else "").strip()
-            if not g(1):
+            ip = self.cell(r, 1)
+            if not ip:
                 continue
-            ins = [int(x) for x in re.findall(r"\d+", g(3)) if int(x) in INPUTS]
-            out.append({"name": g(0) or f"VP {r + 1}", "ip": g(1), "port": int(g(2)) if g(2).isdigit() else PORT,
-                        "inputs": ins or list(INPUTS)})
+            port = self.cell(r, 2)
+            out.append({"name": self.cell(r, 0) or f"VP {r + 1}", "ip": ip, "port": int(port) if port.isdigit() else PORT,
+                        "inputs": self.t.cellWidget(r, 3).get() or list(INPUTS)})
         return out
 
 
@@ -1140,6 +1451,7 @@ class Main(QMainWindow):
         self.setWindowTitle("Christie Control · D20HD-HS")
         self.resize(1200, 820)
         self.cfg, self.cards = load(), []
+        self.locked, self.alerts, self.acked, self.side_frame = False, {}, set(), None
         root = QWidget()
         self.setCentralWidget(root)
         v = QVBoxLayout(root)
@@ -1161,8 +1473,22 @@ class Main(QMainWindow):
         st.setObjectName("accent")
         rf.clicked.connect(lambda: (self.sync_net(), [c.refresh(True) for c in self.cards]))
         st.clicked.connect(self.settings)
-        for w in (t,):
-            top.addWidget(w)
+        self.grp_btn = QPushButton("Actions groupées")
+        menu = QMenu(self.grp_btn)
+        for label, kind in (("Tout allumer", "on"), ("Tout éteindre", "off"),
+                            ("Fermer tous les shutters", "shut_close"), ("Ouvrir tous les shutters", "shut_open")):
+            act = QAction(label, menu)
+            act.triggered.connect(lambda _=False, k=kind: self.group(k))
+            menu.addAction(act)
+        self.grp_btn.setMenu(menu)
+        self.lock_btn = QPushButton("Verrouiller")
+        self.lock_btn.setCheckable(True)
+        self.lock_btn.setToolTip("Verrouille toutes les commandes pour éviter un clic malheureux")
+        self.lock_btn.toggled.connect(self.toggle_lock)
+        top.addWidget(t)
+        top.addSpacing(12)
+        top.addWidget(self.grp_btn)
+        top.addWidget(self.lock_btn)
         top.addStretch()
         top.addWidget(QLabel("Look"))
         top.addWidget(self.look)
@@ -1171,6 +1497,12 @@ class Main(QMainWindow):
         top.addWidget(rf)
         top.addWidget(st)
         v.addLayout(top)
+        self.alert_box = QFrame()
+        self.alert_lay = QVBoxLayout(self.alert_box)
+        self.alert_lay.setContentsMargins(0, 0, 0, 0)
+        self.alert_lay.setSpacing(6)
+        self.alert_box.setVisible(False)
+        v.addWidget(self.alert_box)
         self.area = QScrollArea()
         self.area.setWidgetResizable(True)
         v.addWidget(self.area, 1)
@@ -1181,6 +1513,8 @@ class Main(QMainWindow):
         self.timer.timeout.connect(lambda: (self.sync_net(), [c.refresh() for c in self.cards]))
         self.set_theme(self.theme.currentText(), save=False)
         self.build()
+        if LOAD_WARNING:
+            QTimer.singleShot(400, self.show_load_warning)
 
     def set_theme(self, name, save=True):
         # « Sans thème » désactive le QSS global : les looks personnalisés
@@ -1210,7 +1544,7 @@ class Main(QMainWindow):
             self.side_frame = None
 
     def save(self):
-        CFG.write_text(json.dumps(self.cfg, indent=2, ensure_ascii=False), "utf-8")
+        save_cfg(self.cfg)
 
     def sync_net(self, announce=False):
         """Applique la carte réseau choisie (adresse source des connexions TCP)."""
@@ -1234,6 +1568,9 @@ class Main(QMainWindow):
         if look not in LOOKS:  # look inconnu (réglages d'une autre version) : retour au classique
             look = "classic"
         self.cards = [Card(c, self.msg.setText, self, look) for c in self.cfg["projectors"]]
+        valid = {c.key for c in self.cards}  # alertes : on oublie celles des projecteurs supprimés
+        self.alerts = {k: v for k, v in self.alerts.items() if k.split(":", 1)[1] in valid}
+        self.render_alerts()
         self.side_frame = None
         h = QWidget()
         if look == "side":
@@ -1290,11 +1627,98 @@ class Main(QMainWindow):
         for c in self.cards:
             c.refresh()
 
+    def toggle_lock(self, on):
+        self.locked = on
+        self.lock_btn.setText("Déverrouiller" if on else "Verrouiller")
+        self.lock_btn.setProperty("st", "busy" if on else "off")
+        repolish(self.lock_btn)
+        self.grp_btn.setEnabled(not on)
+        for c in self.cards:
+            c.set_locked(on)
+        self.msg.setText("Commandes verrouillées" if on else "Commandes déverrouillées")
+
+    def group(self, kind):
+        """Actions sur tous les projecteurs, avec confirmation (et décalage à l'allumage)."""
+        if self.locked or not self.cards:
+            return
+        n, gap = len(self.cards), int(self.cfg.get("stagger", 2))
+        spec = {
+            "on": ("pwr", "on", "Tout allumer", f"Allumer les {n} projecteur(s), avec {gap} s d'écart entre chacun ?", "Allumer"),
+            "off": ("pwr", "off", "Tout éteindre",
+                    f"Éteindre les {n} projecteur(s) ?\n\nL'extinction lance un refroidissement qui peut durer plusieurs minutes.", "Tout éteindre"),
+            "shut_close": ("shu", "closed", "Fermer tous les shutters", f"Fermer le shutter des {n} projecteur(s) ? L'image sera coupée.", "Fermer"),
+            "shut_open": ("shu", "open", "Ouvrir tous les shutters", "", ""),
+        }
+        g, k, title, text, ok = spec[kind]
+        if text and not confirm(self, title, text, ok):
+            return
+        gap_ms = gap * 1000 if kind == "on" else 0
+        for i, c in enumerate(self.cards):
+            QTimer.singleShot(i * gap_ms, lambda c=c: self.run_card(c, g, k))
+        self.msg.setText(f"{title} : commande envoyée à {n} projecteur(s)" + (f" (décalage de {gap} s)" if gap_ms and n > 1 else ""))
+
+    @staticmethod
+    def run_card(card, g, k):
+        try:
+            card.go(g, k, False)
+        except RuntimeError:  # carte supprimée entre-temps (changement de look, réglages...)
+            pass
+
+    # --- alertes : bandeau en haut de la fenêtre ---
+    def set_alert(self, key, level, text):
+        new = key not in self.alerts or self.alerts[key][1] != text
+        self.alerts[key] = (level, text)
+        if new and (key, text) not in self.acked:
+            try:
+                QApplication.beep()
+            except Exception:
+                pass
+        self.render_alerts()
+
+    def clear_alert(self, key):
+        if self.alerts.pop(key, None) is not None:
+            self.acked = {x for x in self.acked if x[0] != key}
+            self.render_alerts()
+
+    def ack_alert(self, key):
+        if key in self.alerts:
+            self.acked.add((key, self.alerts[key][1]))
+            self.render_alerts()
+
+    def render_alerts(self):
+        while self.alert_lay.count():
+            w = self.alert_lay.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        shown = 0
+        for key, (level, text) in self.alerts.items():
+            if (key, text) in self.acked:
+                continue
+            border, bgc = {"err": ("#ef4444", "rgba(239,68,68,0.16)"), "warn": ("#f59e0b", "rgba(245,158,11,0.16)")}[level]
+            row = QFrame()
+            row.setObjectName("alertrow")
+            row.setStyleSheet(f"QFrame#alertrow{{background:{bgc};border:1px solid {border};border-radius:8px}}")
+            h = QHBoxLayout(row)
+            h.setContentsMargins(12, 6, 8, 6)
+            h.addWidget(QLabel("⚠  " + text), 1)
+            ok = QPushButton("OK")
+            ok.setToolTip("J'ai vu : masquer cette alerte (elle reviendra si le problème change)")
+            ok.clicked.connect(lambda _=False, k=key: self.ack_alert(k))
+            h.addWidget(ok)
+            self.alert_lay.addWidget(row)
+            shown += 1
+        self.alert_box.setVisible(shown > 0)
+
+    def show_load_warning(self):
+        box = QMessageBox(QMessageBox.Warning, "Réglages", LOAD_WARNING, QMessageBox.Ok, self)
+        box.open()
+
     def settings(self):
         d = Settings(self.cfg, self)
         if d.exec():
             self.cfg["projectors"], self.cfg["poll"] = d.projectors(), d.poll.value()
             self.cfg["iface"] = d.iface.currentData()
+            self.cfg["confirm_off"], self.cfg["stagger"] = d.confirm.isChecked(), d.stagger.value()
             self.save()
             self.build()
 

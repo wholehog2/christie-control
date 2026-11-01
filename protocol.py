@@ -10,6 +10,9 @@ INFO = [  # (requête, libellé)
     ("MIF+SGFT?", "Format du signal"), ("MIF+HREF?", "Fréquence horizontale"),
     ("MIF+VREF?", "Fréquence verticale"), ("SIV?", "Version des commandes"),
 ]
+# Codes de LSE? (dernière erreur système) d'après la doc Christie HS Series
+LSE_TEXT = {1: "la source lumineuse ne s'est pas allumée", 3: "la source lumineuse s'est éteinte de façon inattendue",
+            4: "panne de ventilateur", 5: "surchauffe"}
 MSG = re.compile(r"\(([^()]*)\)")
 REPLY = re.compile(r"^#?([A-Za-z]{3})(?:\+([A-Za-z0-9]{4}))?!\s*(.*)$", re.S)
 
@@ -109,8 +112,10 @@ class Projector:
                     v = None
                 if v is not None:
                     d[key] = v
-        return {"pwr": _power(d.get("PWR")), "shu": _shutter(d.get("SHU")),
-                "src": _source(d.get("SIN+MAIN"))}
+        out = {"pwr": _power(d.get("PWR")), "shu": _shutter(d.get("SHU")), "src": _source(d.get("SIN+MAIN"))}
+        # signal réel sur l'entrée : seulement si le VP est allumé et sur une source identifiée
+        out["sig"] = self.signal() if out["pwr"] == "on" and out["src"] is not None else None
+        return out
 
     def _read_num(self, code):
         try:
@@ -133,6 +138,29 @@ class Projector:
         if got in (0, 1):
             return got == value
         return bool(msgs)  # état illisible : on se fie à l'accusé de réception du VP
+
+    def signal(self):
+        """Signal réellement reçu : (largeur, hauteur) ; False = pas de signal ; None = indéterminé."""
+        try:
+            v = dict(parse(self.ask("MIF+RESL?", timeout=2.0))).get("MIF+RESL")
+        except OSError:
+            return None
+        if v is None:
+            return None
+        s = v.replace('"', "")
+        m = re.search(r"(\d{1,5})\s*[x×X*]\s*(\d{1,5})", s) or re.search(r"^\s*(\d{1,5})\s+(\d{1,5})\b", s)
+        if m:
+            w, h = int(m[1]), int(m[2])
+            return (w, h) if w > 0 and h > 0 else False
+        return False if re.search(r"no\s*signal|none|aucun|^\s*0+\s*$", s, re.I) else None
+
+    def last_error(self):
+        """Dernière erreur système (LSE?) : (code, texte) ; code 0 = aucune ; None = illisible."""
+        try:
+            v = dict(parse(self.ask("LSE?", timeout=2.0))).get("LSE")
+        except OSError:
+            return None
+        return None if v is None else _num_name(v)
 
     def info(self):
         rows = []
