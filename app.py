@@ -885,11 +885,7 @@ class Card(QFrame):
         v.addLayout(self.title(17))
         for cap, items, cols in (
                 ("Alimentation", [self.F("pwr", "on", "Allumer"), self.F("pwr", "off", "Éteindre")], 0),
-                (None, None, 0),
                 ("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")], 0)):
-            if items is None:
-                v.addWidget(self.lamp_panel())
-                continue
             v.addWidget(self.cap(cap))
             if cols:
                 g = QGridLayout()
@@ -903,7 +899,7 @@ class Card(QFrame):
                 for w in items:
                     r.addWidget(w)
                 v.addLayout(r)
-        v.addWidget(self.reglages(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3), self.ori_panel()))
+        v.addWidget(self.reglages(self.lamp_panel(), self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3), self.ori_panel()))
         v.addLayout(self.info_col())
 
     def ui_console(self):
@@ -917,12 +913,11 @@ class Card(QFrame):
         ident.setLayout(self.title(16, True))
         h.addWidget(ident)
         h.addWidget(self.grp("Alimentation", [self.F("pwr", "on", "Allumer"), self.F("pwr", "off", "Éteindre")]))
-        h.addWidget(self.lamp_panel(compact=True, width=230))
         h.addWidget(self.grp("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")]))
         h.addStretch()
         h.addLayout(self.bar(vertical=True))
         v.addLayout(h)
-        v.addWidget(self.reglages(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3), self.ori_panel(compact=True)))
+        v.addWidget(self.reglages(self.lamp_panel(width=420), self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3), self.ori_panel(compact=True)))
         self.strip = QLabel("Données : …")
         self.strip.setObjectName("sub")
         self.strip.setWordWrap(True)
@@ -939,10 +934,9 @@ class Card(QFrame):
         r = QHBoxLayout()
         r.setSpacing(20)
         r.addWidget(self.round_power())
-        r.addWidget(self.lamp_panel(), 2)
         r.addWidget(self.grp("Shutter", [self.S("shu", "open", "Ouvert"), self.S("shu", "closed", "Fermé")]), 1)
         v.addLayout(r)
-        v.addWidget(self.reglages(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3),
+        v.addWidget(self.reglages(self.lamp_panel(), self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3),
                                   self.ori_panel()))
         v.addLayout(self.info_col())
 
@@ -954,14 +948,13 @@ class Card(QFrame):
         r = QHBoxLayout()
         r.setSpacing(14)
         for g in (self.grp("Alimentation", [self.F("pwr", "on", "Allumer"), self.F("pwr", "off", "Éteindre")], vertical=True),
-                  self.lamp_panel(compact=True),
                   self.grp("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")], vertical=True)):
             f = QFrame()
             f.setObjectName("pane")
             QVBoxLayout(f).addWidget(g)
             r.addWidget(f, 1)
         v.addLayout(r)
-        v.addWidget(self.reglages(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3),
+        v.addWidget(self.reglages(self.lamp_panel(), self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3),
                                   self.ori_panel(), framed=True))
         v.addLayout(self.info_col(), 1)
 
@@ -972,11 +965,10 @@ class Card(QFrame):
         v.setSpacing(8)
         v.addLayout(self.title(15, True))
         v.addWidget(self.round_power(), 0, Qt.AlignHCenter)
-        v.addWidget(self.lamp_panel(compact=True))
         v.addWidget(self.cap("Shutter"))
         v.addWidget(self.S("shu", "open", "Ouvert"))
         v.addWidget(self.S("shu", "closed", "Fermé"))
-        v.addWidget(self.reglages(self.ori_panel(compact=True, vertical=True),
+        v.addWidget(self.reglages(self.lamp_panel(compact=True), self.ori_panel(compact=True, vertical=True),
                                   self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], vertical=True)))
         v.addStretch()
         self.lcd = QLabel("—")
@@ -1084,7 +1076,6 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         pv.addWidget(self.cap("ALIMENTATION"), 0, Qt.AlignHCenter)
         pv.addWidget(self.round_power(), 0, Qt.AlignHCenter)
         top.addWidget(power)
-        top.addWidget(self.lamp_panel("LUMINOSITÉ", framed=True), 1)
 
         shutter = QFrame()
         shutter.setObjectName("pane")
@@ -1097,7 +1088,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         v.addLayout(top)
 
         video = self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=4)
-        v.addWidget(self.reglages(video, self.ori_panel(), framed=True))
+        v.addWidget(self.reglages(self.lamp_panel("LUMINOSITÉ"), video, self.ori_panel(), framed=True))
         info = QFrame()
         info.setObjectName("pane")
         iv = QVBoxLayout(info)
@@ -1121,14 +1112,13 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         power.addWidget(self.F("pwr", "on", "Mise sous tension"))
         power.addWidget(self.F("pwr", "off", "Mise hors tension"))
         h.addLayout(power, 1)
-        h.addWidget(self.lamp_panel("LUMINOSITÉ"), 1)
         shutter = QVBoxLayout()
         shutter.addWidget(self.cap("OBTURATEUR"))
         shutter.addWidget(self.F("shu", "open", "Ouvert"))
         shutter.addWidget(self.F("shu", "closed", "Fermé"))
         h.addLayout(shutter, 1)
         v.addWidget(commands)
-        v.addWidget(self.reglages(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], vertical=False),
+        v.addWidget(self.reglages(self.lamp_panel("LUMINOSITÉ"), self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], vertical=False),
                                   self.ori_panel(), framed=True))
         info = QFrame()
         info.setObjectName("pane")
@@ -1152,8 +1142,6 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         lv.addWidget(self.cap("COMMANDES"))
         lv.addWidget(self.round_power(), 0, Qt.AlignHCenter)
         lv.addSpacing(8)
-        lv.addWidget(self.lamp_panel("LUMINOSITÉ", compact=True))
-        lv.addSpacing(8)
         lv.addWidget(self.cap("SHUTTER"))
         lv.addWidget(self.F("shu", "open", "Ouvrir"))
         lv.addWidget(self.F("shu", "closed", "Fermer"))
@@ -1163,7 +1151,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         right = QFrame()
         right.setObjectName("pane")
         rv = QVBoxLayout(right)
-        rv.addWidget(self.reglages(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=2),
+        rv.addWidget(self.reglages(self.lamp_panel("LUMINOSITÉ"), self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=2),
                                    self.ori_panel()))
         rv.addStretch()
         body.addWidget(right, 2)
@@ -1200,7 +1188,6 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         pv.addWidget(self.F("pwr", "on", "ON"))
         pv.addWidget(self.F("pwr", "off", "OFF"))
         top.addWidget(power)
-        top.addWidget(self.lamp_panel("LUMINOSITÉ", framed=True))
         shutter = QFrame()
         shutter.setObjectName("pane")
         shv = QVBoxLayout(shutter)
@@ -1224,7 +1211,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         inputs = QFrame()
         inputs.setObjectName("pane")
         iv = QVBoxLayout(inputs)
-        iv.addWidget(self.reglages(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3),
+        iv.addWidget(self.reglages(self.lamp_panel("LUMINOSITÉ"), self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3),
                                    self.ori_panel()))
         v.addWidget(inputs)
         data = QFrame()
@@ -1249,7 +1236,6 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         pv.addWidget(self.cap("POWER"))
         pv.addWidget(self.round_power(), 0, Qt.AlignHCenter)
         commands.addWidget(power)
-        commands.addWidget(self.lamp_panel("LUMINOSITÉ", framed=True), 1)
         shutter = QFrame()
         shutter.setObjectName("pane")
         sv = QVBoxLayout(shutter)
@@ -1263,7 +1249,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         source = QFrame()
         source.setObjectName("pane")
         srcv = QVBoxLayout(source)
-        srcv.addWidget(self.reglages(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3),
+        srcv.addWidget(self.reglages(self.lamp_panel("LUMINOSITÉ"), self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3),
                                      self.ori_panel()))
         v.addWidget(source)
         info = QFrame()
