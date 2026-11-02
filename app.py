@@ -6,11 +6,11 @@ from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QPlainTextEdit,
-                               QPushButton, QScrollArea, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
+                               QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
                                QMenu, QMessageBox, QVBoxLayout, QWidget)
 from icon_data import ICON_PNG_B64
 from protocol import INPUTS, LSE_TEXT, PORT, Projector, wait_for
-from themes import THEMES, qss, shut_qss
+from themes import THEMES, qss, shut_qss, slider_qss
 
 # CHRISTIE_CONFIG permet de lancer l'appli avec un autre fichier de réglages (ex. pour le simulateur)
 CFG = Path(os.environ["CHRISTIE_CONFIG"]).expanduser() if os.environ.get("CHRISTIE_CONFIG") else Path.home() / ".christie_control.json"
@@ -369,6 +369,48 @@ LOOKS = {
 }
 
 
+LAMP_DEFAULT = {"cmd": "LPP", "unit": "%", "min": 0, "max": 100, "presets": [25, 50, 75, 100]}
+MAX_PRESETS = 8
+
+
+class LampConfig(QDialog):
+    """Réglage de la commande de luminosité (propre à chaque VP)."""
+
+    def __init__(self, parent, cfg):
+        super().__init__(parent)
+        self.setWindowTitle("Luminosité : commande et plage")
+        g = QGridLayout(self)
+        self.cmd = QLineEdit(cfg["cmd"])
+        self.cmd.setMaxLength(3)
+        self.unit = QLineEdit(cfg["unit"])
+        self.unit.setMaxLength(4)
+        self.lo, self.hi = QSpinBox(), QSpinBox()
+        for sp, val in ((self.lo, cfg["min"]), (self.hi, cfg["max"])):
+            sp.setRange(0, 100000)
+            sp.setValue(val)
+        for r, (txt, w) in enumerate((("Commande Christie", self.cmd), ("Unité affichée", self.unit),
+                                      ("Valeur minimale", self.lo), ("Valeur maximale", self.hi))):
+            g.addWidget(QLabel(txt), r, 0)
+            g.addWidget(w, r, 1)
+        note = QLabel("La valeur est lue par (CMD?) et réglée par (CMD valeur). Selon le modèle : LPP (puissance "
+                      "de la lampe, souvent en watts) ou LPI (intensité). Indique la plage acceptée par ton "
+                      "projecteur (voir la documentation Christie).")
+        note.setObjectName("sub")
+        note.setWordWrap(True)
+        note.setMinimumWidth(320)
+        g.addWidget(note, 4, 0, 1, 2)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        g.addWidget(bb, 5, 0, 1, 2)
+
+    def get(self):
+        lo, hi = self.lo.value(), self.hi.value()
+        if hi <= lo:
+            hi = lo + 1
+        return {"cmd": (self.cmd.text().strip().upper() or "LPP")[:3], "unit": self.unit.text().strip(), "min": lo, "max": hi}
+
+
 class Card(QFrame):
     def __init__(self, cfg, status, main, look):
         super().__init__()
@@ -395,6 +437,12 @@ class Card(QFrame):
         self.ins = [i for i in cfg.get("inputs", list(INPUTS)) if i in INPUTS]
         self.src_key, self.src_label = None, None  # source identifiée par le VP (n° d'entrée) et son affichage
         self.ori, self.ori_btn, self.ori_prev, self.ori_loaded = {"ceiling": None, "rear": None}, {}, None, False
+        self.set_folded = self.key in main.cfg.get("settings_folded", [])
+        self.set_sum = None
+        self.lamp_sl, self.lamp_ready, self.lamp_loaded, self.lamp_last, self.lamp_next = None, False, False, None, None
+        self.lamp_timer = QTimer(self)
+        self.lamp_timer.setSingleShot(True)
+        self.lamp_timer.timeout.connect(lambda: self.lamp_commit())
         getattr(self, "ui_" + look)()
         self.set_locked(main.locked)
 
@@ -479,10 +527,10 @@ class Card(QFrame):
         b = QPushButton()
         b.setObjectName("fold")
         b.setCursor(Qt.PointingHandCursor)
-        setting = "folded" if kind == "data" else "video_folded"
+        setting = {"data": "folded", "video": "video_folded", "set": "settings_folded"}[kind]
 
         def is_folded():
-            return self.folded if kind == "data" else self.video_folded
+            return {"data": self.folded, "video": self.video_folded, "set": self.set_folded}[kind]
 
         def paint():
             folded = is_folded()
@@ -490,14 +538,18 @@ class Card(QFrame):
             body.setVisible(not folded)
             if kind == "video":
                 self.update_src_label()
+            elif kind == "set":
+                self.update_set_sum()
 
         def toggle():
             folded = not is_folded()
             if kind == "data":
                 self.folded = folded
+            elif kind == "set":
+                self.set_folded = folded
             else:
                 self.video_folded = folded
-            if kind == "data":  # le panneau vidéo, lui, est géré automatiquement (non mémorisé)
+            if kind in ("data", "set"):  # le panneau vidéo, lui, est géré automatiquement (non mémorisé)
                 states = set(self.main.cfg.get(setting, []))
                 (states.add if folded else states.discard)(self.key)
                 if not folded:
@@ -511,6 +563,245 @@ class Card(QFrame):
             self.video_paint = paint
         paint()
         return b
+
+    def reglages(self, *widgets, framed=False):
+        """Groupe « Réglages » repliable : regroupe les paramètres autres que les données."""
+        body = QWidget()
+        bv = QVBoxLayout(body)
+        bv.setContentsMargins(0, 0, 0, 0)
+        bv.setSpacing(12)
+        for w in widgets:
+            bv.addWidget(w)
+        panel = QWidget()
+        v = QVBoxLayout(panel)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(8)
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        head.addWidget(self.fold_header("Réglages", body, "set"))
+        self.set_sum = QLabel()
+        self.set_sum.setObjectName("sub")
+        head.addWidget(self.set_sum)
+        head.addStretch()
+        v.addLayout(head)
+        v.addWidget(body)
+        self.update_set_sum()
+        if framed:
+            frame = QFrame()
+            frame.setObjectName("pane")
+            QVBoxLayout(frame).addWidget(panel)
+            return frame
+        return panel
+
+    def update_set_sum(self):
+        """Groupe replié : rappel de la source active à côté du titre."""
+        lab = self.set_sum
+        if lab is None:
+            return
+        txt = INPUTS.get(self.src_key, "") if self.set_folded else ""
+        lab.setText(txt)
+        lab.setVisible(bool(txt))
+
+    # --- luminosité : curseur + préréglages ---
+    def lamp_cfg(self):
+        d = dict(LAMP_DEFAULT)
+        d.update(self.main.cfg.get("lamp", {}).get(self.key, {}))
+        return d
+
+    def lamp_store(self, **kw):
+        store = self.main.cfg.setdefault("lamp", {})
+        store.setdefault(self.key, {}).update(kw)
+        self.main.save()
+
+    def lamp_panel(self, cap="Luminosité", framed=False, compact=False, width=0):
+        c = self.lamp_cfg()
+        self.lamp_cols = 3 if compact else 5
+        w = QWidget()
+        if width:
+            w.setFixedWidth(width)
+        v = QVBoxLayout(w)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(6)
+        head = QHBoxLayout()
+        head.setSpacing(6)
+        head.addWidget(self.cap(cap))
+        head.addStretch()
+        self.lamp_val = QLabel("—")
+        self.lamp_val.setStyleSheet("font-weight:600")
+        head.addWidget(self.lamp_val)
+        gear = QPushButton("⚙")
+        gear.setFixedWidth(28)
+        gear.setToolTip("Commande et plage de la luminosité")
+        gear.clicked.connect(self.lamp_config)
+        head.addWidget(gear)
+        v.addLayout(head)
+        sl = QSlider(Qt.Horizontal)
+        sl.setRange(c["min"], c["max"])
+        sl.setCursor(Qt.PointingHandCursor)
+        sl.valueChanged.connect(self.lamp_changed)
+        sl.sliderReleased.connect(lambda: self.lamp_commit())  # envoi dès que le curseur est relâché
+        self.lamp_sl = sl
+        v.addWidget(sl)
+        self.lamp_grid = QGridLayout()
+        self.lamp_grid.setSpacing(6)
+        v.addLayout(self.lamp_grid)
+        self.lamp_rebuild()
+        if framed:
+            frame = QFrame()
+            frame.setObjectName("pane")
+            QVBoxLayout(frame).addWidget(w)
+            return frame
+        return w
+
+    def lamp_rebuild(self):
+        c = self.lamp_cfg()
+        while self.lamp_grid.count():
+            it = self.lamp_grid.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        cur = self.lamp_sl.value()
+        for i, p in enumerate(sorted(set(c["presets"]))):
+            b = QPushButton(f"{p} {c['unit']}".strip())
+            b.setStyleSheet("padding:3px 8px;font-size:12px")
+            b.setCursor(Qt.PointingHandCursor)
+            b.setProperty("st", "ok" if p == cur and self.lamp_ready else "off")
+            b.setToolTip("Clic : régler cette luminosité · clic droit : supprimer ce préréglage")
+            b.clicked.connect(lambda _=False, val=p: self.lamp_preset(val))
+            b.setContextMenuPolicy(Qt.CustomContextMenu)
+            b.customContextMenuRequested.connect(lambda pos, val=p, btn=b: self.lamp_chip_menu(btn, pos, val))
+            self.lamp_grid.addWidget(b, i // self.lamp_cols, i % self.lamp_cols)
+        n = len(set(c["presets"]))
+        add = QPushButton("+")
+        add.setStyleSheet("padding:3px 8px;font-size:12px")
+        add.setToolTip("Ajouter la valeur actuelle du curseur comme préréglage")
+        add.setEnabled(n < MAX_PRESETS)
+        add.clicked.connect(self.lamp_add_preset)
+        self.lamp_grid.addWidget(add, n // self.lamp_cols, n % self.lamp_cols)
+
+    def lamp_chip_menu(self, btn, pos, val):
+        m = QMenu(btn)
+        act = m.addAction(f"Supprimer le préréglage {val}")
+        if m.exec(btn.mapToGlobal(pos)) is act:
+            c = self.lamp_cfg()
+            self.lamp_store(presets=[p for p in c["presets"] if p != val])
+            self.lamp_rebuild()
+
+    def lamp_add_preset(self):
+        c = self.lamp_cfg()
+        v = self.lamp_sl.value()
+        if v not in c["presets"] and len(c["presets"]) < MAX_PRESETS:
+            self.lamp_store(presets=sorted(set(c["presets"]) | {v}))
+            self.lamp_rebuild()
+            self.status(f"{self.cfg['name']} · préréglage {v} {c['unit']} ajouté")
+
+    def lamp_preset(self, val):
+        self.lamp_sl.setValue(val)
+        self.lamp_commit()
+
+    def lamp_config(self):
+        d = LampConfig(self, self.lamp_cfg())
+        if d.exec():
+            new = d.get()
+            self.lamp_store(**new)
+            self.lamp_sl.setRange(new["min"], new["max"])
+            self.lamp_loaded = self.lamp_ready = False
+            self.lamp_val.setText("—")
+            self.lamp_rebuild()
+            bg(self.read_lamp, self.apply_lamp)
+
+    def lamp_changed(self, v):
+        self.lamp_val.setText(f"{v} {self.lamp_cfg()['unit']}".strip())
+        if self.lamp_ready:
+            self.lamp_rebuild_marks()
+        if not self.lamp_sl.isSliderDown() and self.lamp_ready:  # clic sur la rainure, clavier, molette
+            self.lamp_timer.start(400)
+
+    def lamp_rebuild_marks(self):
+        v = self.lamp_sl.value()
+        for i in range(self.lamp_grid.count()):
+            b = self.lamp_grid.itemAt(i).widget()
+            if b is not None and b.text() != "+":
+                try:
+                    p = int(b.text().split()[0])
+                except ValueError:
+                    continue
+                b.setProperty("st", "ok" if p == v else "off")
+                repolish(b)
+
+    def lamp_commit(self):
+        self.lamp_timer.stop()
+        v = self.lamp_sl.value()
+        c = self.lamp_cfg()
+        if self.main.locked:
+            self.status("Interface verrouillée : déverrouille pour envoyer une commande")
+            if self.lamp_last is not None:
+                self.lamp_set_silent(self.lamp_last)
+            return
+        if v == self.lamp_last:
+            return
+        if "lamp" in self.pending:  # un envoi est en cours : on enverra la dernière valeur ensuite
+            self.lamp_next = v
+            return
+        self.pending.add("lamp")
+        cmd = f"{c['cmd']} {v}"
+        tol = max(1, round((c["max"] - c["min"]) * 0.01))
+
+        def work():
+            msgs = self.p.ask(cmd, quiet=True)
+            bad = [m for m in msgs if "ERR" in m]
+            if bad:
+                raise RuntimeError("refusé par le projecteur")
+            t_end = time.time() + 6
+            while time.time() < t_end:
+                cur = self.read_lamp()
+                if cur is not None and abs(cur - v) <= tol:
+                    return cur
+                time.sleep(0.6)
+            return None
+
+        def done(res, err):
+            self.pending.discard("lamp")
+            good = res is not None and not err
+            unit = c["unit"]
+            if good:
+                self.lamp_last, self.lamp_ready = res, True
+                self.lamp_set_silent(res)
+            self.status(f"{self.cfg['name']} · luminosité {v} {unit} : "
+                        + ("confirmée" if good else f"non confirmée ({err or 'pas de réponse du VP'})"))
+            nxt, self.lamp_next = self.lamp_next, None
+            if nxt is not None and nxt != self.lamp_last:
+                self.lamp_set_silent(nxt)
+                self.lamp_commit()
+        bg(work, done)
+
+    def lamp_set_silent(self, v):
+        """Positionne le curseur sans déclencher d'envoi."""
+        sl = self.lamp_sl
+        sl.blockSignals(True)
+        sl.setRange(min(sl.minimum(), v), max(sl.maximum(), v))
+        sl.setValue(v)
+        sl.blockSignals(False)
+        self.lamp_val.setText(f"{v} {self.lamp_cfg()['unit']}".strip())
+        self.lamp_rebuild_marks()
+
+    def read_lamp(self):
+        """Lit la luminosité courante par (CMD?) : entier, ou None si le VP ne répond pas."""
+        code = self.lamp_cfg()["cmd"]
+        for m in self.p.ask(f"{code}?", timeout=3):
+            mm = re.search(rf"{re.escape(code)}!\s*(-?\d+)", m, re.I)
+            if mm:
+                return int(mm[1])
+        return None
+
+    def apply_lamp(self, v, err):
+        if "lamp" in self.pending or self.lamp_sl is None or self.lamp_sl.isSliderDown():
+            return
+        if err or v is None:
+            self.lamp_sl.setToolTip("Luminosité non lue : vérifie la commande avec ⚙")
+            return
+        self.lamp_sl.setToolTip("")
+        self.lamp_ready, self.lamp_last = True, v
+        self.lamp_set_silent(v)
 
     def video_panel(self, items, cols=0, vertical=False, framed=False):
         """Panneau Entrée vidéo repliable, commun aux cinq présentations."""
@@ -576,7 +867,11 @@ class Card(QFrame):
         v.addLayout(self.title(17))
         for cap, items, cols in (
                 ("Alimentation", [self.F("pwr", "on", "Allumer"), self.F("pwr", "off", "Éteindre")], 0),
+                (None, None, 0),
                 ("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")], 0)):
+            if items is None:
+                v.addWidget(self.lamp_panel())
+                continue
             v.addWidget(self.cap(cap))
             if cols:
                 g = QGridLayout()
@@ -590,8 +885,7 @@ class Card(QFrame):
                 for w in items:
                     r.addWidget(w)
                 v.addLayout(r)
-        v.addWidget(self.ori_panel())
-        v.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3))
+        v.addWidget(self.reglages(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3), self.ori_panel()))
         v.addLayout(self.info_col())
 
     def ui_console(self):
@@ -605,12 +899,12 @@ class Card(QFrame):
         ident.setLayout(self.title(16, True))
         h.addWidget(ident)
         h.addWidget(self.grp("Alimentation", [self.F("pwr", "on", "Allumer"), self.F("pwr", "off", "Éteindre")]))
+        h.addWidget(self.lamp_panel(compact=True, width=230))
         h.addWidget(self.grp("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")]))
-        h.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3))
         h.addStretch()
         h.addLayout(self.bar(vertical=True))
         v.addLayout(h)
-        v.addWidget(self.ori_panel(compact=True))
+        v.addWidget(self.reglages(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3), self.ori_panel(compact=True)))
         self.strip = QLabel("Données : …")
         self.strip.setObjectName("sub")
         self.strip.setWordWrap(True)
@@ -627,10 +921,11 @@ class Card(QFrame):
         r = QHBoxLayout()
         r.setSpacing(20)
         r.addWidget(self.round_power())
+        r.addWidget(self.lamp_panel(), 2)
         r.addWidget(self.grp("Shutter", [self.S("shu", "open", "Ouvert"), self.S("shu", "closed", "Fermé")]), 1)
         v.addLayout(r)
-        v.addWidget(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3))
-        v.addWidget(self.ori_panel())
+        v.addWidget(self.reglages(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3),
+                                  self.ori_panel()))
         v.addLayout(self.info_col())
 
     def ui_side(self):
@@ -641,15 +936,15 @@ class Card(QFrame):
         r = QHBoxLayout()
         r.setSpacing(14)
         for g in (self.grp("Alimentation", [self.F("pwr", "on", "Allumer"), self.F("pwr", "off", "Éteindre")], vertical=True),
+                  self.lamp_panel(compact=True),
                   self.grp("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")], vertical=True)):
             f = QFrame()
             f.setObjectName("pane")
             QVBoxLayout(f).addWidget(g)
             r.addWidget(f, 1)
-        r.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins],
-                                     cols=2, framed=True), 1)
         v.addLayout(r)
-        v.addWidget(self.ori_panel(framed=True))
+        v.addWidget(self.reglages(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3),
+                                  self.ori_panel(), framed=True))
         v.addLayout(self.info_col(), 1)
 
     def ui_mixer(self):
@@ -659,12 +954,12 @@ class Card(QFrame):
         v.setSpacing(8)
         v.addLayout(self.title(15, True))
         v.addWidget(self.round_power(), 0, Qt.AlignHCenter)
+        v.addWidget(self.lamp_panel(compact=True))
         v.addWidget(self.cap("Shutter"))
         v.addWidget(self.S("shu", "open", "Ouvert"))
         v.addWidget(self.S("shu", "closed", "Fermé"))
-        v.addWidget(self.ori_panel(compact=True, vertical=True))
-        v.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins],
-                                     vertical=True))
+        v.addWidget(self.reglages(self.ori_panel(compact=True, vertical=True),
+                                  self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], vertical=True)))
         v.addStretch()
         self.lcd = QLabel("—")
         self.lcd.setObjectName("lcd")
@@ -734,6 +1029,7 @@ QPushButton#fold { color: #75d8ee; }
             extra += "QPushButton#fold { color: #ffad32; }\n"
         elif palette == "blue":
             extra += "QPushButton#fold { color: #42c7ff; }\n"
+        extra += slider_qss(c)
         extra += shut_qss(c)  # bouton « Fermer » du shutter : couleur chaude propre à la palette
         self.setStyleSheet(f"""
 QWidget {{ background: transparent; color: {c['text']}; }}
@@ -770,6 +1066,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         pv.addWidget(self.cap("ALIMENTATION"), 0, Qt.AlignHCenter)
         pv.addWidget(self.round_power(), 0, Qt.AlignHCenter)
         top.addWidget(power)
+        top.addWidget(self.lamp_panel("LUMINOSITÉ", framed=True), 1)
 
         shutter = QFrame()
         shutter.setObjectName("pane")
@@ -781,9 +1078,8 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         top.addWidget(shutter, 1)
         v.addLayout(top)
 
-        video = self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=4, framed=True)
-        v.addWidget(video)
-        v.addWidget(self.ori_panel(framed=True))
+        video = self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=4)
+        v.addWidget(self.reglages(video, self.ori_panel(), framed=True))
         info = QFrame()
         info.setObjectName("pane")
         iv = QVBoxLayout(info)
@@ -807,19 +1103,15 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         power.addWidget(self.F("pwr", "on", "Mise sous tension"))
         power.addWidget(self.F("pwr", "off", "Mise hors tension"))
         h.addLayout(power, 1)
+        h.addWidget(self.lamp_panel("LUMINOSITÉ"), 1)
         shutter = QVBoxLayout()
         shutter.addWidget(self.cap("OBTURATEUR"))
         shutter.addWidget(self.F("shu", "open", "Ouvert"))
         shutter.addWidget(self.F("shu", "closed", "Fermé"))
         h.addLayout(shutter, 1)
         v.addWidget(commands)
-        v.addWidget(self.ori_panel(framed=True))
-
-        source = QFrame()
-        source.setObjectName("pane")
-        sv = QVBoxLayout(source)
-        sv.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], vertical=False))
-        v.addWidget(source)
+        v.addWidget(self.reglages(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], vertical=False),
+                                  self.ori_panel(), framed=True))
         info = QFrame()
         info.setObjectName("pane")
         iv = QVBoxLayout(info)
@@ -842,6 +1134,8 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         lv.addWidget(self.cap("COMMANDES"))
         lv.addWidget(self.round_power(), 0, Qt.AlignHCenter)
         lv.addSpacing(8)
+        lv.addWidget(self.lamp_panel("LUMINOSITÉ", compact=True))
+        lv.addSpacing(8)
         lv.addWidget(self.cap("SHUTTER"))
         lv.addWidget(self.F("shu", "open", "Ouvrir"))
         lv.addWidget(self.F("shu", "closed", "Fermer"))
@@ -851,11 +1145,11 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         right = QFrame()
         right.setObjectName("pane")
         rv = QVBoxLayout(right)
-        rv.addWidget(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=2))
+        rv.addWidget(self.reglages(self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=2),
+                                   self.ori_panel()))
         rv.addStretch()
         body.addWidget(right, 2)
         v.addLayout(body, 2)
-        v.addWidget(self.ori_panel(framed=True))
 
         info = QFrame()
         info.setObjectName("pane")
@@ -888,6 +1182,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         pv.addWidget(self.F("pwr", "on", "ON"))
         pv.addWidget(self.F("pwr", "off", "OFF"))
         top.addWidget(power)
+        top.addWidget(self.lamp_panel("LUMINOSITÉ", framed=True))
         shutter = QFrame()
         shutter.setObjectName("pane")
         shv = QVBoxLayout(shutter)
@@ -911,9 +1206,9 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         inputs = QFrame()
         inputs.setObjectName("pane")
         iv = QVBoxLayout(inputs)
-        iv.addWidget(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3))
+        iv.addWidget(self.reglages(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3),
+                                   self.ori_panel()))
         v.addWidget(inputs)
-        v.addWidget(self.ori_panel(framed=True))
         data = QFrame()
         data.setObjectName("pane")
         dv = QVBoxLayout(data)
@@ -936,6 +1231,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         pv.addWidget(self.cap("POWER"))
         pv.addWidget(self.round_power(), 0, Qt.AlignHCenter)
         commands.addWidget(power)
+        commands.addWidget(self.lamp_panel("LUMINOSITÉ", framed=True), 1)
         shutter = QFrame()
         shutter.setObjectName("pane")
         sv = QVBoxLayout(shutter)
@@ -949,9 +1245,9 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         source = QFrame()
         source.setObjectName("pane")
         srcv = QVBoxLayout(source)
-        srcv.addWidget(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3))
+        srcv.addWidget(self.reglages(self.video_panel([self.S("src", i, INPUTS[i]) for i in self.ins], cols=3),
+                                     self.ori_panel()))
         v.addWidget(source)
-        v.addWidget(self.ori_panel(framed=True))
         info = QFrame()
         info.setObjectName("pane")
         infov = QVBoxLayout(info)
@@ -1004,6 +1300,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             warn = '<span style="color:#f59e0b">●</span>&nbsp;' if (self.sig is False and not self.video_folded) else ""
             lab.setText(f'{warn}<b>{INPUTS[k]}</b>{extra}')
         lab.setVisible(show)
+        self.update_set_sum()
 
     def set_video_folded(self, folded):
         self.video_folded = folded
@@ -1187,6 +1484,10 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         if not err and not self.info_loaded:
             self.info_loaded = True
             self.load_info()
+        if not err and "lamp" not in self.pending and self.lamp_sl is not None:
+            # luminosité lue à la connexion, puis à chaque actualisation : automatique (réglage
+            # « Actualisation auto » des paramètres ; 0 = off) ou manuelle (bouton Actualiser)
+            bg(self.read_lamp, self.apply_lamp)
         self.update_state_lbl()
 
     # --- compte à rebours, signal, erreurs, verrouillage ---

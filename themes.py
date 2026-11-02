@@ -15,8 +15,15 @@ def shut_qss(t):
             f'QPushButton[shut="1"][st="ok"]:hover{{background:{t["shut_h"]}}}\n')
 
 
+def slider_qss(t):
+    """Curseur discret : fine rainure, partie remplie à la couleur d'accent, poignée ronde."""
+    return (f'QSlider::groove:horizontal{{height:4px;background:{t["border"]};border-radius:2px}}\n'
+            f'QSlider::sub-page:horizontal{{background:{t["accent"]};border-radius:2px}}\n'
+            f'QSlider::handle:horizontal{{width:16px;height:16px;margin:-6px 0;border-radius:8px;background:{t["text"]}}}\n')
+
+
 def qss(t):
-    return shut_qss(t) + f"""
+    return shut_qss(t) + slider_qss(t) + f"""
 QWidget{{background:transparent;color:{t['text']};font-size:13px}}
 QMainWindow,QDialog{{background:{t['bg']}}}
 QFrame#card{{background:{t['card']};border:1px solid {t['border']};border-radius:14px}}
