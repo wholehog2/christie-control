@@ -458,7 +458,10 @@ class Card(QFrame):
         return w
 
     def F(self, g, k, t):
-        return self.reg(g, k, Func(t, lambda: self.go(g, k)))
+        f = self.reg(g, k, Func(t, lambda: self.go(g, k)))
+        if g == "shu":
+            f.led.setVisible(False)  # pas de LED : « Ouvrir » passe en bleu, « Fermer » en rouge-orangé quand actif
+        return f
 
     def S(self, g, k, t):
         return self.reg(g, k, Seg(t, lambda: self.go(g, k)))
@@ -665,7 +668,7 @@ class Card(QFrame):
             b.setStyleSheet("padding:3px 8px;font-size:12px")
             b.setCursor(Qt.PointingHandCursor)
             b.setProperty("st", "ok" if p == cur and self.lamp_ready else "off")
-            b.setToolTip("Clic : régler cette luminosité · clic droit : supprimer ce préréglage")
+            b.setToolTip("Clic : régler cette luminosité · clic droit ou bouton − : supprimer ce préréglage")
             b.clicked.connect(lambda _=False, val=p: self.lamp_preset(val))
             b.setContextMenuPolicy(Qt.CustomContextMenu)
             b.customContextMenuRequested.connect(lambda pos, val=p, btn=b: self.lamp_chip_menu(btn, pos, val))
@@ -677,14 +680,26 @@ class Card(QFrame):
         add.setEnabled(n < MAX_PRESETS)
         add.clicked.connect(self.lamp_add_preset)
         self.lamp_grid.addWidget(add, n // self.lamp_cols, n % self.lamp_cols)
+        rm = QPushButton("−")
+        rm.setStyleSheet("padding:3px 8px;font-size:12px")
+        rm.setToolTip("Supprimer le préréglage correspondant à la valeur actuelle du curseur")
+        rm.setEnabled(cur in c["presets"])
+        rm.clicked.connect(lambda: self.lamp_del_preset(self.lamp_sl.value()))
+        self.lamp_rm = rm
+        self.lamp_grid.addWidget(rm, (n + 1) // self.lamp_cols, (n + 1) % self.lamp_cols)
 
     def lamp_chip_menu(self, btn, pos, val):
         m = QMenu(btn)
         act = m.addAction(f"Supprimer le préréglage {val}")
         if m.exec(btn.mapToGlobal(pos)) is act:
-            c = self.lamp_cfg()
+            self.lamp_del_preset(val)
+
+    def lamp_del_preset(self, val):
+        c = self.lamp_cfg()
+        if val in c["presets"]:
             self.lamp_store(presets=[p for p in c["presets"] if p != val])
             self.lamp_rebuild()
+            self.status(f"{self.cfg['name']} · préréglage {val} {c['unit']} supprimé")
 
     def lamp_add_preset(self):
         c = self.lamp_cfg()
@@ -718,6 +733,9 @@ class Card(QFrame):
 
     def lamp_rebuild_marks(self):
         v = self.lamp_sl.value()
+        rm = getattr(self, "lamp_rm", None)
+        if rm is not None:
+            rm.setEnabled(v in self.lamp_cfg()["presets"])
         for i in range(self.lamp_grid.count()):
             b = self.lamp_grid.itemAt(i).widget()
             if b is not None and b.text() != "+":
@@ -1279,7 +1297,9 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             if shut:
                 w.setProperty("shut", "1")  # couleur définie par le thème (themes.py / skin)
             f.led.set(st)
-            if shut and w is not f:  # Func : le bouton n'a pas de propriété d'état par défaut
+            # Func : le bouton n'a pas de propriété d'état par défaut. « Fermer » devient rouge-orangé,
+            # « Ouvrir » devient bleu (couleur d'accent), comme les boutons du look Industriel.
+            if group == "shu" and w is not f:
                 w.setProperty("st", st)
                 repolish(w)
 
