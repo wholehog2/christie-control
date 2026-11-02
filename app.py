@@ -571,7 +571,7 @@ class Card(QFrame):
         """Groupe « Réglages » repliable : regroupe les paramètres autres que les données."""
         body = QWidget()
         bv = QVBoxLayout(body)
-        bv.setContentsMargins(0, 0, 0, 0)
+        bv.setContentsMargins(16, 0, 0, 0)  # contenu en retrait : on voit ce qui appartient au groupe
         bv.setSpacing(12)
         for w in widgets:
             bv.addWidget(w)
