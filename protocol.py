@@ -103,7 +103,10 @@ class Projector:
 
     def state(self):
         # want=3 : on attend les 3 réponses (le VP peut répondre lentement) ...
-        d = dict(parse(self.ask("PWR?", "SHU?", "SIN+MAIN?", want=3)))
+        msgs = self.ask("PWR?", "SHU?", "SIN+MAIN?", want=3)
+        if not msgs:  # connexion acceptée mais aucune réponse : le VP est injoignable en pratique
+            raise OSError("aucune réponse du projecteur")
+        d = dict(parse(msgs))
         for cmd, key in (("PWR?", "PWR"), ("SHU?", "SHU"), ("SIN+MAIN?", "SIN+MAIN")):
             if key not in d:  # ... et on redemande individuellement celles qui manquent
                 try:

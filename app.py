@@ -12,7 +12,8 @@ from icon_data import ICON_PNG_B64
 from protocol import INPUTS, LSE_TEXT, PORT, Projector, wait_for
 from themes import THEMES, qss
 
-CFG = Path.home() / ".christie_control.json"
+# CHRISTIE_CONFIG permet de lancer l'appli avec un autre fichier de réglages (ex. pour le simulateur)
+CFG = Path(os.environ["CHRISTIE_CONFIG"]).expanduser() if os.environ.get("CHRISTIE_CONFIG") else Path.home() / ".christie_control.json"
 BAK = CFG.with_name(CFG.name + ".bak")
 DEFAULT = {"theme": "Sombre", "poll": 5, "confirm_off": True, "stagger": 2,
            "projectors": [{"name": "VP 1", "ip": "192.168.0.10", "port": PORT, "inputs": list(INPUTS)}]}
@@ -213,7 +214,8 @@ class Console(QDialog):
                 return
         self.inp.clear()
         self.out.appendPlainText(f"→ ({c})")
-        bg(lambda: self.p.ask(c, timeout=4),
+        quiet = "?" not in c  # écriture : inutile d'attendre une réponse jusqu'au bout
+        bg(lambda: self.p.ask(c, timeout=4, quiet=quiet),
            lambda r, e: self.out.appendPlainText(f"✖ {e}" if e else "\n".join(f"← ({m})" for m in r) or "(aucune réponse)"))
 
 
@@ -1099,7 +1101,11 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             self.pwr_start(key)
 
         def work():
-            self.p.ask(cmd, quiet=True)            # 1) on envoie
+            msgs = self.p.ask(cmd, quiet=True)     # 1) on envoie
+            bad = [m for m in msgs if "ERR" in m]
+            if bad:                                # refus explicite du VP : inutile d'attendre la fin du délai
+                txt = re.search(r'"([^"]*)"', bad[0])
+                raise RuntimeError("refusé par le projecteur" + (f" ({txt[1]})" if txt else ""))
             return wait_for(getter, key, timeout)  # 2) on vérifie que c'est appliqué
 
         def done(ok, err):
