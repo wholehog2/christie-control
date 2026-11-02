@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
                                QMenu, QMessageBox, QVBoxLayout, QWidget)
 from icon_data import ICON_PNG_B64
 from protocol import INPUTS, LSE_TEXT, PORT, Projector, wait_for
-from themes import THEMES, qss
+from themes import THEMES, qss, shut_qss
 
 # CHRISTIE_CONFIG permet de lancer l'appli avec un autre fichier de réglages (ex. pour le simulateur)
 CFG = Path(os.environ["CHRISTIE_CONFIG"]).expanduser() if os.environ.get("CHRISTIE_CONFIG") else Path.home() / ".christie_control.json"
@@ -680,36 +680,43 @@ class Card(QFrame):
                 "bg": "#0b1728", "card": "#142943", "panel": "#102238",
                 "text": "#edf6ff", "sub": "#9db8d2", "accent": "#08a9ff",
                 "border": "#24547b", "btn": "#1c3856", "hover": "#285078",
+                "shut": "#c4210f", "shut_h": "#e03a22",
             },
             "elegant": {
                 "bg": "#111318", "card": "#191c22", "panel": "#101216",
                 "text": "#f0f1f4", "sub": "#a3a8b2", "accent": "#aeb8c7",
                 "border": "#353a44", "btn": "#252a33", "hover": "#343b47",
+                "shut": "#8f1d14", "shut_h": "#b02a1d",
             },
             "light": {
                 "bg": "#e9eef7", "card": "#f8faff", "panel": "#edf3fc",
                 "text": "#17243a", "sub": "#65748b", "accent": "#0878e8",
                 "border": "#cbd8eb", "btn": "#e5edf9", "hover": "#d5e4f7",
+                "shut": "#d6311b", "shut_h": "#ea4a30",
             },
             "lightdark": {  # même identité que « light », en sombre
                 "bg": "#0d1524", "card": "#131f35", "panel": "#101a2d",
                 "text": "#e8f0fc", "sub": "#8fa3bf", "accent": "#0878e8",
                 "border": "#25395a", "btn": "#1a2a45", "hover": "#243a5c",
+                "shut": "#b3200f", "shut_h": "#d4331c",
             },
             "lightmid": {  # luminosité intermédiaire entre « lightdark » et « light »
                 "bg": "#46577a", "card": "#566a8e", "panel": "#4e6084",
                 "text": "#f6f9ff", "sub": "#d3def2", "accent": "#0a74e0",
                 "border": "#7487ad", "btn": "#5b7098", "hover": "#6a80a8",
+                "shut": "#c8321a", "shut_h": "#e24a30",
             },
             "industrial": {
                 "bg": "#171717", "card": "#222222", "panel": "#191919",
                 "text": "#f4f1eb", "sub": "#aaa39a", "accent": "#ff9800",
                 "border": "#55402a", "btn": "#303030", "hover": "#414141",
+                "shut": "#b3200f", "shut_h": "#d4331c",
             },
             "color": {
                 "bg": "#10172b", "card": "#18243d", "panel": "#152d43",
                 "text": "#f4f7ff", "sub": "#b9c7e8", "accent": "#25c7db",
                 "border": "#3d4d86", "btn": "#263b60", "hover": "#354d7c",
+                "shut": "#e0301e", "shut_h": "#f2492f",
             },
         }
         c = palettes[palette]
@@ -727,6 +734,7 @@ QPushButton#fold { color: #75d8ee; }
             extra += "QPushButton#fold { color: #ffad32; }\n"
         elif palette == "blue":
             extra += "QPushButton#fold { color: #42c7ff; }\n"
+        extra += shut_qss(c)  # bouton « Fermer » du shutter : couleur chaude propre à la palette
         self.setStyleSheet(f"""
 QWidget {{ background: transparent; color: {c['text']}; }}
 QFrame#card {{ background: {c['card']}; border: 1px solid {c['border']}; border-radius: 14px; }}
@@ -969,7 +977,15 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
 
     def led(self, group, key, state):
         for k, f in self.groups[group].items():
-            f.led.set(state if k == key else "off")
+            st = state if k == key else "off"
+            shut = (group, k) == ("shu", "closed")
+            w = getattr(f, "btn", f)  # Func : le bouton est f.btn ; Seg : c'est f lui-même
+            if shut:
+                w.setProperty("shut", "1")  # couleur définie par le thème (themes.py / skin)
+            f.led.set(st)
+            if shut and w is not f:  # Func : le bouton n'a pas de propriété d'état par défaut
+                w.setProperty("st", st)
+                repolish(w)
 
     def update_src_label(self):
         """Source identifiée : en grand à côté du titre quand le panneau est replié (ou dès que le signal manque)."""
@@ -984,8 +1000,9 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
                 extra = f'&nbsp;&nbsp;<span style="font-size:13px;color:#8b93a7">{self.sig[0]}×{self.sig[1]}</span>'
             elif self.sig is False:
                 extra = '&nbsp;&nbsp;<span style="font-size:13px;color:#f59e0b">pas de signal</span>'
-            dot = "#f59e0b" if self.sig is False else "#22c55e"
-            lab.setText(f'<span style="color:{dot}">●</span>&nbsp;<b>{INPUTS[k]}</b>{extra}')
+            # pas de point quand le panneau est replié ; point orange seulement déplié et sans signal
+            warn = '<span style="color:#f59e0b">●</span>&nbsp;' if (self.sig is False and not self.video_folded) else ""
+            lab.setText(f'{warn}<b>{INPUTS[k]}</b>{extra}')
         lab.setVisible(show)
 
     def set_video_folded(self, folded):
@@ -1527,7 +1544,7 @@ class Main(QMainWindow):
         # conservent ainsi exactement leur propre palette et les widgets
         # standards utilisent le style natif Fusion.
         if name == getattr(self, "no_theme", "Sans thème"):
-            QApplication.instance().setStyleSheet("")
+            QApplication.instance().setStyleSheet(shut_qss(THEMES["Sombre"]))
         else:
             QApplication.instance().setStyleSheet(qss(THEMES[name]))
         self.cfg["theme"] = name
