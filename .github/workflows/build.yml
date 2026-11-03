@@ -19,7 +19,7 @@ jobs:
             name: macos-apple-silicon
             extra: --icon icon.icns
             out: dist/ChristieControl-macos-apple-silicon.zip
-          - os: macos-15-intel      # Mac Intel (MacBook Pro 2017...)
+          - os: macos-13-intel      # Mac Intel (MacBook Pro 2017...)
             name: macos-intel
             extra: --icon icon.icns
             out: dist/ChristieControl-macos-intel.zip
