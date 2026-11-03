@@ -19,10 +19,6 @@ jobs:
             name: macos-apple-silicon
             extra: --icon icon.icns
             out: dist/ChristieControl-macos-apple-silicon.zip
-          - os: macos-14-intel
-            name: macos-intel
-            extra: --icon icon.icns
-            out: dist/ChristieControl-macos-intel.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
