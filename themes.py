@@ -49,6 +49,7 @@ QPushButton#pwr{{min-width:84px;max-width:84px;min-height:84px;max-height:84px;b
 QPushButton#pwr[st="ok"]{{background:transparent;border-color:#22c55e}}
 QPushButton#pwr[st="busy"]{{background:transparent;border-color:#f59e0b}}
 QPushButton#pwr[st="err"]{{background:transparent;border-color:#ef4444}}
+QPushButton#pwr[st="down"]{{background:transparent;border-color:#ef4444}}
 QLabel#lcd{{font-family:Menlo,Consolas,monospace;font-size:18px;color:#4ade80;background:#0b140d;border-radius:8px;padding:8px}}
 QScrollBar:vertical{{width:10px;background:transparent}}
 QScrollBar::handle:vertical{{background:{t['border']};border-radius:5px;min-height:30px}}

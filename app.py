@@ -1,7 +1,7 @@
 import base64, ipaddress, json, os, re, shutil, sys, threading, time
 from pathlib import Path
-from PySide6.QtCore import QByteArray, QObject, QPointF, QRectF, QSize, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPen, QPixmap
+from PySide6.QtCore import QByteArray, QObject, QPointF, QRectF, QSize, QTimer, QVariantAnimation, Qt, Signal
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout,
@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
                                QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
                                QMenu, QMessageBox, QVBoxLayout, QWidget)
 from icon_data import ICON_PNG_B64
-from protocol import INPUTS, LSE_TEXT, PORT, Projector, wait_for
+from protocol import INPUTS, LSE_TEXT, PORT, Projector, reply_state, wait_for
 from themes import THEMES, qss, shut_qss, slider_qss
 
 # CHRISTIE_CONFIG permet de lancer l'appli avec un autre fichier de réglages (ex. pour le simulateur)
@@ -214,9 +214,10 @@ class Console(QDialog):
                 return
         self.inp.clear()
         self.out.appendPlainText(f"→ ({c})")
-        quiet = "?" not in c  # écriture : inutile d'attendre une réponse jusqu'au bout
-        bg(lambda: self.p.ask(c, timeout=4, quiet=quiet),
-           lambda r, e: self.out.appendPlainText(f"✖ {e}" if e else "\n".join(f"← ({m})" for m in r) or "(aucune réponse)"))
+        # on attend la réponse (jusqu'à 3,5 s) même pour une écriture : un VP lent répond parfois après 0,5 s
+        bg(lambda: self.p.ask(c, timeout=3.5, idle=0.5),
+           lambda r, e: self.out.appendPlainText(f"✖ {e}" if e else "\n".join(f"← ({m})" for m in r)
+                                                 or "(aucune réponse du projecteur dans les 3,5 s)"))
 
 
 def power_icon(col):
@@ -272,8 +273,9 @@ class RoundPower(QPushButton):
 
     def paint(self):
         s = self.states.values()
-        st = "busy" if "busy" in s else "err" if "err" in s else "ok" if self.states["on"] == "ok" else "off"
-        self.setIcon(power_icon({"ok": "#22c55e", "busy": "#f59e0b", "err": "#ef4444", "off": "#8b93a7"}[st]))
+        st = ("busy" if "busy" in s else "err" if "err" in s else "ok" if self.states["on"] == "ok"
+              else "down" if self.states["off"] == "ok" else "off")   # down = éteint et confirmé : anneau rouge
+        self.setIcon(power_icon({"ok": "#22c55e", "busy": "#f59e0b", "err": "#ef4444", "down": "#ef4444", "off": "#8b93a7"}[st]))
         self.setProperty("st", st)
         repolish(self)
 
@@ -350,6 +352,202 @@ class OrientBtn(Seg):
         super().set(st)
 
 
+def lens_svg(c):  # objectif : cercles concentriques
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><g fill="none" stroke="{c}" stroke-width="3">'
+            f'<circle cx="24" cy="24" r="16"/><circle cx="24" cy="24" r="8"/></g><circle cx="24" cy="24" r="3" fill="{c}"/>'
+            f'<g stroke="{c}" stroke-width="3" stroke-linecap="round"><path d="M24 2V6M24 42V46M2 24H6M42 24H46"/></g></svg>')
+
+
+def center_svg(c):  # centrer le décalage (shift) : cadre avec flèches vers le centre
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><g stroke="{c}" fill="none" stroke-width="3" '
+            f'stroke-linecap="round"><rect x="5" y="5" width="38" height="38" rx="6"/><path d="M24 12V19M24 36V29M12 24H19M36 24H29"/>'
+            f'</g><circle cx="24" cy="24" r="3" fill="{c}"/></svg>')
+
+
+def lock_svg(c, closed):
+    shackle = "M16 22V16a8 8 0 0 1 16 0v6" if closed else "M16 22V16a8 8 0 0 1 15-4"
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48"><path d="{shackle}" fill="none" stroke="{c}" '
+            f'stroke-width="4" stroke-linecap="round"/><rect x="10" y="22" width="28" height="20" rx="4" fill="{c}"/></svg>')
+
+
+class VuMeter(QWidget):
+    """Vumètre à segments (ventilateur) : vert → ambre → rouge, repère de crête, valeur animée."""
+    SEG = 12
+
+    def __init__(self, name):
+        super().__init__()
+        self.name, self.value, self.shown, self.peak, self.vmax = name, None, 0.0, 0, 5000
+        self.anim = QVariantAnimation(self)
+        self.anim.setDuration(450)
+        self.anim.valueChanged.connect(self._tick)
+        self.setFixedSize(50, 150)
+
+    def _tick(self, v):
+        self.shown = float(v)
+        self.update()
+
+    def set_value(self, v):
+        self.value = v
+        if v is not None:
+            if v > self.vmax:  # l'échelle s'élargit si besoin
+                self.vmax = int(-(-v * 1.2 // 1000) * 1000)
+            self.peak = max(self.peak, v)
+        self.anim.stop()
+        self.anim.setStartValue(self.shown)
+        self.anim.setEndValue(float(v or 0))
+        self.anim.start()
+        self.setToolTip(f"{self.name} : {v} tr/min" if v is not None else f"{self.name} : pas de mesure")
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        txt = self.palette().color(QPalette.WindowText)  # couleur de texte du thème
+        w, h, n, gap, top, bot = self.width(), self.height(), self.SEG, 3, 20, 18
+        sh = (h - top - bot - gap * (n - 1)) / n
+        lit = round(min(1.0, self.shown / self.vmax) * n) if self.vmax else 0
+        peak_i = round(min(1.0, self.peak / self.vmax) * n) if (self.value is not None and self.vmax) else 0
+        for i in range(n):  # i = 0 en bas
+            y = top + (n - 1 - i) * (sh + gap)
+            t = i / (n - 1)
+            col = QColor(34, 197, 94) if t < 0.6 else QColor(245, 158, 11) if t < 0.85 else QColor(239, 68, 68)
+            if i >= lit:
+                col = QColor(txt)
+                col.setAlpha(38)
+            p.setPen(Qt.NoPen)
+            p.setBrush(col)
+            p.drawRoundedRect(QRectF(7, y, w - 14, sh), 2.5, 2.5)
+            if peak_i - 1 == i and peak_i > lit:  # repère de crête
+                pk = QColor(txt)
+                pk.setAlpha(170)
+                p.setPen(QPen(pk, 1.3))
+                p.setBrush(Qt.NoBrush)
+                p.drawRoundedRect(QRectF(7, y, w - 14, sh), 2.5, 2.5)
+        f = QFont()
+        f.setPixelSize(11)
+        f.setBold(True)
+        p.setFont(f)
+        p.setPen(txt)
+        p.drawText(QRectF(0, 0, w, top - 2), Qt.AlignCenter, f"{int(self.value):,}".replace(",", " ") if self.value is not None else "—")
+        f.setBold(False)
+        f.setPixelSize(10)
+        p.setFont(f)
+        p.drawText(QRectF(0, h - bot + 2, w, bot - 2), Qt.AlignCenter, self.name)
+
+
+class DataPanel(QWidget):
+    """Données du projecteur en quatre blocs : modèle / heures / erreur · signal · réseau · versions + ventilateurs."""
+
+    def __init__(self):
+        super().__init__()
+        g = QGridLayout(self)
+        g.setContentsMargins(0, 0, 0, 0)
+        g.setSpacing(10)
+        g.setColumnStretch(0, 1)
+        g.setColumnStretch(1, 1)
+        self.lse = None
+        self.lse_val = None
+        self.model = QLabel("—")
+        self.model.setStyleSheet("font-size:17px;font-weight:700")
+        self.model.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        f1, v1, self.r1 = self._block("Projecteur")
+        v1.addWidget(self.model)
+        v1.addLayout(self.r1)
+        v1.addStretch()
+        f2, v2, self.r2 = self._block("Signal d'entrée")
+        v2.addLayout(self.r2)
+        v2.addStretch()
+        f3, v3, self.r3 = self._block("Réseau")
+        v3.addLayout(self.r3)
+        v3.addStretch()
+        f4, v4, self.r4 = self._block("Versions et ventilateurs")
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        row.addLayout(self.r4, 1)
+        self.meters = [VuMeter(f"FAN {i}") for i in (1, 2, 3)]
+        mrow = QHBoxLayout()
+        mrow.setSpacing(0)
+        for m in self.meters:
+            mrow.addWidget(m)
+        row.addLayout(mrow)
+        v4.addLayout(row)
+        for fr, r, c in ((f1, 0, 0), (f2, 0, 1), (f3, 1, 0), (f4, 1, 1)):
+            g.addWidget(fr, r, c)
+
+    @staticmethod
+    def _block(title):
+        f = QFrame()
+        f.setObjectName("pane")
+        v = QVBoxLayout(f)
+        v.setContentsMargins(12, 10, 12, 10)
+        v.setSpacing(6)
+        c = QLabel(title)
+        c.setObjectName("cap")
+        v.addWidget(c)
+        rows = QGridLayout()
+        rows.setHorizontalSpacing(12)
+        rows.setVerticalSpacing(3)
+        rows.setColumnStretch(1, 1)
+        return f, v, rows
+
+    @staticmethod
+    def _fill(rows, items, empty="—"):
+        """Remplit une grille libellé / valeur ; renvoie les étiquettes de valeur."""
+        while rows.count():
+            w = rows.takeAt(0).widget()
+            if w:
+                w.deleteLater()
+        vals = []
+        for i, (k, v) in enumerate(items or [("", empty)]):
+            a, b = QLabel(k), QLabel(str(v))
+            a.setObjectName("sub")
+            for x in (a, b):
+                x.setWordWrap(True)
+            b.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            rows.addWidget(a, i, 0, Qt.AlignTop)
+            rows.addWidget(b, i, 1, Qt.AlignTop)
+            vals.append(b)
+        return vals
+
+    @staticmethod
+    def _lse_text(lse):
+        if lse is None:
+            return "—", False
+        n, name = lse
+        return ("Aucune", False) if not n else ((LSE_TEXT.get(n) or name or f"code {n}"), True)
+
+    def set_lse(self, lse):
+        """Dernière erreur système : rouge si le code est différent de 0."""
+        self.lse = lse
+        if self.lse_val is not None:
+            txt, bad = self._lse_text(lse)
+            self.lse_val.setText(txt)
+            self.lse_val.setStyleSheet("color:#ef4444;font-weight:700" if bad else "")
+
+    def set_fans(self, rpms):
+        for m, v in zip(self.meters, rpms):
+            m.set_value(v)
+
+    def set_error(self, msg):
+        self.model.setText("—")
+        for r in (self.r1, self.r2, self.r3, self.r4):
+            self._fill(r, [], "")
+        self._fill(self.r1, [("Erreur", msg)])
+        self.lse_val = None
+        self.set_fans([None, None, None])
+
+    def set_data(self, d):
+        self.model.setText(d["model"] or "Modèle non communiqué")
+        hours = [(k, pretty(k, v)) for k, v in d["hours"]]
+        txt, bad = self._lse_text(d["lse"])
+        vals = self._fill(self.r1, hours + [("Dernière erreur système", txt)])
+        self.lse_val = vals[-1]
+        self.set_lse(d["lse"])
+        self._fill(self.r2, d["signal"])
+        self._fill(self.r3, d["network"])
+        self._fill(self.r4, d["versions"] + d["other"])
+        self.set_fans(d["fans"] or [None, None, None])
+
+
 ORI = {"ceiling": ("CEL", "Au plafond"), "rear": ("SOR", "En rétro")}
 CMDS = {("pwr", "on"): ("PWR 1", "power", 150), ("pwr", "off"): ("PWR 0", "power", 240),
         ("shu", "open"): ("SHU 0", "shutter", 8), ("shu", "closed"): ("SHU 1", "shutter", 8)}
@@ -369,7 +567,7 @@ LOOKS = {
 }
 
 
-LAMP_DEFAULT = {"cmd": "LPP", "unit": "%", "min": 0, "max": 100, "presets": [25, 50, 75, 100]}
+LAMP_DEFAULT = {"cmd": "BRT", "unit": "%", "min": 0, "max": 100, "presets": [25, 50, 75, 100]}
 MAX_PRESETS = 8
 
 
@@ -392,8 +590,8 @@ class LampConfig(QDialog):
                                       ("Valeur minimale", self.lo), ("Valeur maximale", self.hi))):
             g.addWidget(QLabel(txt), r, 0)
             g.addWidget(w, r, 1)
-        note = QLabel("La valeur est lue par (CMD?) et réglée par (CMD valeur). Selon le modèle : LPP (puissance "
-                      "de la lampe, souvent en watts) ou LPI (intensité). Indique la plage acceptée par ton "
+        note = QLabel("La valeur est lue par (CMD?) et réglée par (CMD valeur). Luminosité de l'image : BRT "
+                      "(0 à 100 %, 50 par défaut) ; LPP règle la puissance de la source lumineuse. Indique la plage acceptée par ton "
                       "projecteur (voir la documentation Christie).")
         note.setObjectName("sub")
         note.setWordWrap(True)
@@ -408,7 +606,7 @@ class LampConfig(QDialog):
         lo, hi = self.lo.value(), self.hi.value()
         if hi <= lo:
             hi = lo + 1
-        return {"cmd": (self.cmd.text().strip().upper() or "LPP")[:3], "unit": self.unit.text().strip(), "min": lo, "max": hi}
+        return {"cmd": (self.cmd.text().strip().upper() or "BRT")[:3], "unit": self.unit.text().strip(), "min": lo, "max": hi}
 
 
 class Card(QFrame):
@@ -430,6 +628,8 @@ class Card(QFrame):
         self.pwr_timer = QTimer(self)
         self.pwr_timer.timeout.connect(self.refresh_info)
         self.state_lbl = None
+        self.data_panel, self.prev_pwr, self.last_details = None, None, None
+        self.lens_locked, self.lens_btns, self.lens_lock = True, [], None  # boutons d'objectif : verrouillés par défaut
         self.video_folded = False  # automatique : replié quand la source est identifiée, déplié sinon
         self.grid = QGridLayout()
         self.grid.setHorizontalSpacing(12)
@@ -607,6 +807,14 @@ class Card(QFrame):
 
     # --- luminosité : curseur + préréglages ---
     def lamp_cfg(self):
+        cfg = self.main.cfg
+        if not cfg.get("lamp_brt"):  # migration unique : l'ancienne valeur par défaut (LPP) devient BRT
+            for v in cfg.get("lamp", {}).values():
+                if v.get("cmd") == "LPP":
+                    for k in ("cmd", "min", "max", "unit"):
+                        v.pop(k, None)
+            cfg["lamp_brt"] = True
+            self.main.save()
         d = dict(LAMP_DEFAULT)
         d.update(self.main.cfg.get("lamp", {}).get(self.key, {}))
         return d
@@ -870,7 +1078,8 @@ class Card(QFrame):
         l = QVBoxLayout(body)
         l.setContentsMargins(0, 0, 0, 0)
         l.setSpacing(6)
-        l.addLayout(self.grid)
+        self.data_panel = DataPanel()
+        l.addWidget(self.data_panel)
         l.addLayout(self.bar())
         v.addWidget(self.fold_header("Données du projecteur", body))
         v.addWidget(body)
@@ -1057,6 +1266,7 @@ QPushButton[st="busy"] {{ border: 2px solid #f59e0b; }}
 QPushButton[st="err"] {{ border: 2px solid #ef4444; }}
 QPushButton#pwr {{ border: 4px solid {c['border']}; border-radius: 42px; }}
 QPushButton#pwr[st="ok"] {{ border-color: #22c55e; }}
+QPushButton#pwr[st="down"] {{ border-color: #ef4444; }}
 QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 8px; }}
 {extra}
 """)
@@ -1276,16 +1486,17 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             self.act(group, key, c, getattr(self.p, g), t)
 
     def led(self, group, key, state):
+        red = {"shu": "closed", "pwr": "off"}.get(group)  # bouton rouge quand cet état est confirmé
         for k, f in self.groups[group].items():
             st = state if k == key else "off"
-            shut = (group, k) == ("shu", "closed")
-            w = getattr(f, "btn", f)  # Func : le bouton est f.btn ; Seg : c'est f lui-même
-            if shut:
+            w = getattr(f, "btn", f)  # Func : le bouton est f.btn ; Seg : f lui-même ; Ring (bouton rond) : aucun
+            tint = hasattr(w, "setProperty")
+            if tint and k == red:
                 w.setProperty("shut", "1")  # couleur définie par le thème (themes.py / skin)
             f.led.set(st)
-            # Func : le bouton n'a pas de propriété d'état par défaut. « Fermer » devient rouge-orangé,
-            # « Ouvrir » devient bleu (couleur d'accent), comme les boutons du look Industriel.
-            if group == "shu" and w is not f:
+            # Func : le bouton n'a pas de propriété d'état par défaut : « Fermer » / « Éteindre » deviennent rouges,
+            # « Ouvrir » / « Allumer » prennent la couleur d'accent.
+            if group in ("shu", "pwr") and tint and w is not f:
                 w.setProperty("st", st)
                 repolish(w)
 
@@ -1327,6 +1538,8 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
 
     # --- position du projecteur : au plafond / en rétro ---
     def ori_panel(self, compact=False, vertical=False, framed=False):
+        """Réglages mécaniques : aperçu, position du projecteur (plafond / rétro, l'un au-dessus de l'autre)
+        et, à droite, l'objectif (calibrage, centrer le shift, verrou)."""
         size = 28 if compact else 40
         self.ori_prev = OriPreview(compact)
         b1 = OrientBtn("Au plafond\nImage à l'envers", ceiling_svg, lambda: self.toggle_ori("ceiling"), size)
@@ -1335,12 +1548,20 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         b2.setToolTip("Rétroprojection : inverse l'image de gauche à droite (commande SOR)")
         self.ori_btn = {"ceiling": b1, "rear": b2}
         self.lockables += [b1, b2]
-        body = QWidget()
-        l = QVBoxLayout(body) if vertical else QHBoxLayout(body)
-        l.setContentsMargins(0, 0, 0, 0)
-        l.setSpacing(10)
+        bc = OrientBtn("Calibrage objectif", lens_svg, lambda: self.lens("LCB+HOME 1", bc, "Calibrage de l'objectif"), size)
+        bs = OrientBtn("Centrer Shift", center_svg, lambda: self.lens("LCB+HOME 0", bs, "Centrage du shift"), size)
+        bc.setToolTip("Calibrage de l'objectif (commande LCB+HOME 1)")
+        bs.setToolTip("Centrer le décalage (shift) de l'objectif (commande LCB+HOME 0)")
+        lk = QPushButton()
+        lk.setFixedSize(36, 36)
+        lk.setIconSize(QSize(20, 20))
+        lk.setCursor(Qt.PointingHandCursor)
+        lk.clicked.connect(self.toggle_lens_lock)
+        self.lens_btns, self.lens_lock = [bc, bs], lk
+        self.lockables.append(lk)
+
         tip = ("Aperçu (pas un bouton) : la lettre F montre comment l'image sera affichée avec les réglages "
-               "ci-contre. Le point vert marque le coin haut-gauche de l'image d'origine.")
+               "de position. Le point vert marque le coin haut-gauche de l'image d'origine.")
         self.ori_prev.setToolTip(tip)
         pv = QWidget()
         pl = QVBoxLayout(pv)
@@ -1352,26 +1573,55 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         cap.setAlignment(Qt.AlignCenter)
         cap.setToolTip(tip)
         pl.addWidget(cap)
-        l.addWidget(pv, 0, Qt.AlignHCenter if vertical else Qt.AlignVCenter)
-        l.addWidget(b1, 1)
-        l.addWidget(b2, 1)
-        if not vertical:  # boutons de largeur raisonnable même dans les looks très larges
-            b1.setMaximumWidth(300)
-            b2.setMaximumWidth(300)
+
+        c1 = QWidget()  # colonne « position »
+        l1 = QVBoxLayout(c1)
+        l1.setContentsMargins(0, 0, 0, 0)
+        l1.setSpacing(8)
+        l1.addWidget(self.cap("Position du projecteur"))
+        l1.addWidget(b1)
+        l1.addWidget(b2)
+        c2 = QWidget()  # colonne « objectif » : deux boutons + petit bouton de verrouillage
+        l2 = QVBoxLayout(c2)
+        l2.setContentsMargins(0, 0, 0, 0)
+        l2.setSpacing(8)
+        l2.addWidget(self.cap("Objectif"))
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        btns = QVBoxLayout()
+        btns.setSpacing(8)
+        btns.addWidget(bc)
+        btns.addWidget(bs)
+        row.addLayout(btns, 1)
+        row.addWidget(lk, 0, Qt.AlignVCenter)
+        l2.addLayout(row)
+
+        body = QWidget()
+        if vertical:
+            l = QVBoxLayout(body)
+            l.setContentsMargins(0, 0, 0, 0)
+            l.setSpacing(10)
+            l.addWidget(pv, 0, Qt.AlignHCenter)
+            l.addWidget(c1)
+            l.addWidget(c2)
+        else:
+            l = QHBoxLayout(body)
+            l.setContentsMargins(0, 0, 0, 0)
+            l.setSpacing(14)
+            l.addWidget(pv, 0, Qt.AlignVCenter)
+            l.addWidget(c1, 1)
+            l.addWidget(c2, 1)
+            for b in (b1, b2, bc, bs):
+                b.setMaximumWidth(250)
             l.addStretch(1)
-        panel = QWidget()
-        v = QVBoxLayout(panel)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(6)
-        v.addWidget(self.cap("Position du projecteur"))
-        v.addWidget(body)
+        self.apply_lens_lock()
         self.paint_ori()
         if framed:
             frame = QFrame()
             frame.setObjectName("pane")
-            QVBoxLayout(frame).addWidget(panel)
+            QVBoxLayout(frame).addWidget(body)
             return frame
-        return panel
+        return body
 
     def paint_ori(self):
         if self.ori_prev:
@@ -1421,12 +1671,14 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             self.pwr_start(key)
 
         def work():
-            msgs = self.p.ask(cmd, quiet=True)     # 1) on envoie
+            msgs = self.p.ask(cmd, timeout=1.5, idle=0.3)  # 1) on envoie et on lit la réponse du VP
             bad = [m for m in msgs if "ERR" in m]
             if bad:                                # refus explicite du VP : inutile d'attendre la fin du délai
                 txt = re.search(r'"([^"]*)"', bad[0])
                 raise RuntimeError("refusé par le projecteur" + (f" ({txt[1]})" if txt else ""))
-            return wait_for(getter, key, timeout)  # 2) on vérifie que c'est appliqué
+            if reply_state(msgs, group) == key:    # 2) la réponse annonce déjà le nouvel état : couleur tout de suite
+                return True
+            return wait_for(getter, key, timeout, every=1.5 if group == "pwr" else 0.6)  # 3) sinon, relecture
 
         def done(ok, err):
             self.pending.discard(group)
@@ -1434,6 +1686,14 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
                 self.pwr_stop()
             good = bool(ok) and not err
             self.led(group, key, "ok" if good else "err")
+            if group == "pwr" and good:
+                if key == "off":   # éteint : plus aucune couleur sur le shutter ni sur la source
+                    self.led("shu", None, "ok")
+                    self.led("src", None, "ok")
+                    self.sync_video(None)
+                    self.mark_off()
+                else:              # allumé : on relit tout (état, luminosité, position, données)
+                    self.refresh(True)
             if group == "src" and good:
                 self.src_key = key
                 self.set_video_folded(True)
@@ -1466,13 +1726,23 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
                 self.status(f"{name} : de nouveau en ligne")
             self.fail = 0
             self.main.clear_alert("off:" + self.key)
+        on = (not err) and st["pwr"] == "on"
         for g in self.groups:
             if g in self.pending:
                 continue
-            self.led(g, None if err else st[g], "ok")
+            val = None if err else st[g]
+            if g in ("shu", "src") and not on:
+                val = None  # éteint, en veille ou en transition : shutter et source sans couleur
+            self.led(g, val, "ok")
         if "src" not in self.pending:
-            self.sync_video(None if err else st.get("src"))
-        self.on_signal(None if err else st.get("sig"))
+            self.sync_video(st.get("src") if on else None)
+        self.on_signal(st.get("sig") if on else None)
+        pw = None if err else st["pwr"]
+        if pw == "on" and self.prev_pwr not in (None, "on"):  # le VP vient de s'allumer (appli ou télécommande)
+            self.ori_loaded = False
+            self.load_info()
+        if pw is not None:
+            self.prev_pwr = pw
         if not err and "pwr" not in self.pending:  # allumage / refroidissement lancé ailleurs (télécommande...)
             if st["pwr"] == "busy":
                 if self.pwr_t0 is None:
@@ -1490,11 +1760,32 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         if not err and not self.info_loaded:
             self.info_loaded = True
             self.load_info()
-        if not err and "lamp" not in self.pending and self.lamp_sl is not None:
-            # luminosité lue à la connexion, puis à chaque actualisation : automatique (réglage
-            # « Actualisation auto » des paramètres ; 0 = off) ou manuelle (bouton Actualiser)
-            bg(self.read_lamp, self.apply_lamp)
+        if self.lamp_sl is not None and "lamp" not in self.pending:
+            if on:  # luminosité (BRT) lue dès que le VP est allumé, puis à chaque actualisation
+                self.lamp_sl.setEnabled(True)
+                bg(self.read_lamp, self.apply_lamp)
+            else:
+                self.mark_off()
+        if self.data_panel is not None and not self.folded:  # vumètres des ventilateurs
+            if on:
+                bg(self.p.fans, self.apply_fans)
+            else:
+                self.mark_off()
         self.update_state_lbl()
+
+    def mark_off(self):
+        """VP éteint, en transition ou injoignable : luminosité grisée, ventilateurs à l'arrêt."""
+        if self.lamp_sl is not None and "lamp" not in self.pending:
+            self.lamp_sl.setEnabled(False)
+            self.lamp_ready = False
+            self.lamp_val.setText("—")
+            self.lamp_sl.setToolTip("Le projecteur doit être allumé pour régler la luminosité")
+        if self.data_panel is not None:
+            self.data_panel.set_fans([None, None, None])
+
+    def apply_fans(self, fans, err):
+        if self.data_panel is not None:
+            self.data_panel.set_fans([None, None, None] if err else fans)
 
     # --- compte à rebours, signal, erreurs, verrouillage ---
     def pwr_start(self, target):
@@ -1540,6 +1831,8 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         else:
             self.lse_text = LSE_TEXT.get(n, name or f"code {n}")
             self.main.set_alert(k, "warn", f"{self.cfg['name']} : dernière erreur système — {self.lse_text}")
+        if self.data_panel is not None:
+            self.data_panel.set_lse((n, name))
         self.update_state_lbl()
 
     def update_state_lbl(self):
@@ -1563,50 +1856,73 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         self.locked = locked
         for w in self.lockables:
             w.setEnabled(not locked)
+        self.apply_lens_lock()
+
+    def toggle_lens_lock(self):
+        self.lens_locked = not self.lens_locked
+        self.apply_lens_lock()
+
+    def apply_lens_lock(self):
+        for b in self.lens_btns:
+            b.setEnabled(not self.lens_locked and not self.main.locked)
+        lk = self.lens_lock
+        if lk is not None:
+            lk.setIcon(svg_icon(lock_svg("#8b93a7" if self.lens_locked else "#f59e0b", self.lens_locked)))
+            lk.setProperty("st", "off" if self.lens_locked else "busy")
+            repolish(lk)
+            lk.setToolTip("Verrouillé : clique pour déverrouiller les boutons de l'objectif" if self.lens_locked
+                          else "Déverrouillé : clique pour reverrouiller")
+
+    @staticmethod
+    def _reset_btn(btn):
+        try:
+            btn.set("off")
+        except RuntimeError:  # bouton supprimé entre-temps
+            pass
+
+    def lens(self, cmd, btn, label):
+        """Commandes d'objectif (LCB+HOME 1 : calibrage, LCB+HOME 0 : centrer le shift)."""
+        if self.main.locked or self.lens_locked:
+            return
+        btn.set("busy")
+
+        def done(msgs, err):
+            bad = [m for m in (msgs or []) if "ERR" in m]
+            good = not err and not bad
+            btn.set("off" if good else "err")
+            self.status(f"{self.cfg['name']} · {label} ({cmd}) : " + ("commande envoyée" if good else f"échec ({err or bad[0]})"))
+            if not good:
+                QTimer.singleShot(3000, lambda: self._reset_btn(btn))
+        bg(lambda: self.p.ask(cmd, timeout=1.5, idle=0.4), done)
 
     def load_info(self):
-        bg(self.p.info, self.show_info)
+        bg(self.p.details, self.show_details)
 
-    def show_info(self, rows, err):
-        rows = [("Erreur", str(err))] if err else rows
-
-        # Les réponses d'information Christie contiennent parfois le code de
-        # paramètre sur trois chiffres, puis la valeur et enfin son libellé.
-        # Présenter le libellé dans la colonne de gauche et la valeur à droite.
-        # Exemple : "000 2090 Total Projector Hours" ->
-        #           "Total Projector Hours" | "2090"
-        formatted_rows = []
-        for key, value in rows:
-            match = re.match(r"^\s*\d{3}\s+(\S+)\s+(.+?)\s*$", str(value))
-            if match:
-                display_value, display_label = match.groups()
-                formatted_rows.append((display_label, display_value))
-            else:
-                formatted_rows.append((str(key), str(value)))
-        rows = formatted_rows
-        if not err:  # masque les lignes sans donnée ; heures et températures mises en forme
-            rows = [(k, pretty(k, v)) for k, v in rows if v != "non disponible"] or [("Données", "aucune donnée")]
-
-        if self.strip is not None:  # look Console : une ligne de données
-            ok = [f"{k} : {v}" for k, v in rows if v != "non disponible"]
-            self.strip.setText("   ·   ".join(ok[:5]) or "Aucune donnée disponible")
+    def show_details(self, d, err):
+        """Affiche les données rangées par catégories (panneau, bandeau de la Console ou afficheur du Mixeur)."""
+        self.last_details = d
+        if err or d is None:
+            msg = str(err) if err else "aucune donnée"
+            if self.strip is not None:
+                self.strip.setText(f"Données : {msg}")
+            if self.lcd is not None:
+                self.lcd.setText("—")
+            if self.data_panel is not None:
+                self.data_panel.set_error(msg)
             return
-        if self.lcd is not None:  # look Mixeur : un seul afficheur (1re donnée)
-            self.lcd.setText(rows[0][1][:16] if rows else "—")
-            self.lcd.setToolTip("\n".join(f"{k} : {v}" for k, v in rows))
-            return
-        while self.grid.count():
-            w = self.grid.takeAt(0).widget()
-            if w:
-                w.deleteLater()
-        for i, (k, val) in enumerate(rows[:self.max_rows]):
-            a, b = QLabel(k), QLabel(val)
-            a.setObjectName("sub")
-            b.setWordWrap(True)
-            b.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            self.grid.addWidget(a, i, 0, Qt.AlignTop)
-            self.grid.addWidget(b, i, 1)
-        self.grid.setColumnStretch(1, 1)
+        hours = [(k, pretty(k, v)) for k, v in d["hours"]]
+        if self.strip is not None:  # look Console : une ligne
+            parts = ([d["model"]] if d["model"] else []) + [f"{k} : {v}" for k, v in hours]
+            lse = d["lse"]
+            if lse and lse[0]:
+                parts.append("Erreur : " + (LSE_TEXT.get(lse[0]) or lse[1] or f"code {lse[0]}"))
+            self.strip.setText("   ·   ".join(parts) or "Aucune donnée disponible")
+        if self.lcd is not None:  # look Mixeur : un afficheur (1re valeur, détail dans l'infobulle)
+            self.lcd.setText(hours[0][1][:16] if hours else "—")
+            allrows = [("Modèle", d["model"])] + hours + d["signal"] + d["network"] + d["versions"] + d["other"]
+            self.lcd.setToolTip("\n".join(f"{k} : {v}" for k, v in allrows if v))
+        if self.data_panel is not None:
+            self.data_panel.set_data(d)
 
 
 class InputsCell(QWidget):
@@ -1778,7 +2094,7 @@ class Settings(QDialog):
 class Main(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Christie Control · D20HD-HS")
+        self.setWindowTitle("Christie Control · D20HD-HS" + (f"  —  RÉGLAGES DE TEST : {CFG.name}" if os.environ.get("CHRISTIE_CONFIG") else ""))
         self.resize(1200, 820)
         self.cfg, self.cards = load(), []
         self.locked, self.alerts, self.acked, self.side_frame = False, {}, set(), None
@@ -1836,7 +2152,7 @@ class Main(QMainWindow):
         self.area = QScrollArea()
         self.area.setWidgetResizable(True)
         v.addWidget(self.area, 1)
-        self.msg = QLabel("Prêt")
+        self.msg = QLabel(f"Prêt · réglages : {CFG}")
         self.msg.setObjectName("sub")
         v.addWidget(self.msg)
         self.timer = QTimer(self)

@@ -66,6 +66,87 @@ def _source(v):
     return n if n in INPUTS else None
 
 
+# ------------------------------------------------------------------ données du projecteur
+FW_LABELS = {"1": "F-MCU", "2": "S-MCU", "3": "M-MCU", "4": "L-MCU", "5": "K-MCU", "6": "LAN", "7": "Formateur",
+             "8": "HDBaseT", "A": "FPGA 1", "B": "FPGA 2", "C": "FPGA 3"}
+SUB_LABELS = {"MDLN": "Modèle", "SNUM": "N° de série", "NERS": "Résolution native", "RELV": "Version de la release",
+              "ETH0": "Adresse IP", "SUB0": "Masque", "GATE": "Passerelle", "MAC0": "Adresse MAC", "DHCP": "DHCP",
+              "HOST": "Nom d'hôte", "PDNS": "DNS", "SDNS": "DNS 2", "RESL": "Résolution", "SGFT": "Format du signal",
+              "VREF": "Fréquence verticale", "HREF": "Fréquence horizontale"}
+
+
+def clean_rows(pairs):
+    """[(clé, valeur)] -> [(clé, libellé, valeur)] : guillemets retirés, formats courants décomposés.
+    « 000 2090 Total Projector Hours » -> (« Total Projector Hours », « 2090 ») ; « Libellé : valeur » ; sous-codes connus."""
+    out = []
+    for key, value in pairs:
+        if key == "ERR":
+            continue
+        v = str(value).replace('"', "").strip()
+        sub = key.split("+", 1)[1] if "+" in key else ""
+        m = re.match(r"^\s*\d{1,3}\s+(\S+)\s+(.+?)\s*$", v)
+        m2 = re.match(r"^([A-Za-z][^:=]{2,40}?)\s*[:=]\s*(.+)$", v)
+        if m:
+            label, val = m[2], m[1]
+        elif m2:
+            label, val = m2[1].strip(), m2[2].strip()
+        elif sub.startswith("FWV"):
+            label, val = "Firmware " + FW_LABELS.get(sub[3:], sub[3:]), v
+        elif sub in SUB_LABELS:
+            label, val = SUB_LABELS[sub], v
+        else:
+            label, val = key, v
+        out.append((key, label, val))
+    return out
+
+
+def classify(label, value, key=""):
+    """Catégorie d'une donnée : model, hours, versions, signal, network ou other."""
+    sub = key.split("+", 1)[1].lower() if "+" in key else ""
+    lab = label.lower()
+    if re.search(r"\bd\d{2}[a-z]{2}\d?[- ]?hs\b", f"{label} {value}".lower()) or sub in ("mdln", "modl") \
+            or re.search(r"model|modèle|modele", lab):
+        return "model"
+    if re.search(r"hour|heure|\bhrs?\b", lab):
+        return "hours"
+    if sub.startswith("fwv") or sub == "relv" or re.search(r"version|firmware|release|\bfw\b|mcu|fpga|formatter|formateur|hdbase|\blan\b", lab):
+        return "versions"
+    if sub in ("resl", "sgft", "vref", "href", "pixc") or re.search(r"resolution|résolution|signal|refresh|fréq|freq", lab):
+        return "signal"
+    if sub in ("eth0", "sub0", "gate", "mac0", "dhcp", "host", "pdns", "sdns") \
+            or re.search(r"\bip\b|subnet|masque|gateway|passerelle|\bmac\b|dhcp|dns|host|network|réseau|reseau|ethernet", lab):
+        return "network"
+    return "other"
+
+
+def _rpm(v):
+    """Vitesse d'un ventilateur (tr/min) dans une réponse de FAN+FA0n? ; None si illisible."""
+    if v is None:
+        return None
+    s = re.sub(r"(?<=\d)[ \u00a0](?=\d{3}\b)", "", str(v).replace('"', ""))  # « 4 210 » -> « 4210 »
+    m = re.search(r"(\d+(?:[.,]\d+)?)\s*rpm", s, re.I)
+    if m:
+        return int(float(m[1].replace(",", ".")))
+    m = re.match(r"^\s*\d{1,3}\s+(\d{2,6})\b", s)  # « 001 4210 Fan 1 »
+    if m:
+        return int(m[1])
+    s = re.sub(r"\b(fan|fa|ventilo\w*)\s*0*\d+\b", " ", s, flags=re.I)
+    nums = [int(x) for x in re.findall(r"\d+", s)]
+    return max(nums) if nums else None
+
+
+def reply_state(msgs, group):
+    """État annoncé par le VP dans sa réponse à une commande (None si la réponse n'en contient pas)."""
+    d = dict(parse(msgs))
+    if group == "pwr":
+        return _power(d.get("PWR"))
+    if group == "shu":
+        return _shutter(d.get("SHU"))
+    if group == "src":
+        return _source(d.get("SIN+MAIN"))
+    return None
+
+
 class Projector:
     def __init__(self, ip, port=PORT):
         self.ip, self.port = ip, int(port)
@@ -164,6 +245,63 @@ class Projector:
         except OSError:
             return None
         return None if v is None else _num_name(v)
+
+    def fans(self):
+        """Vitesse (tr/min) des ventilateurs 1 à 3 : [rpm | None] x 3."""
+        try:
+            d = dict(parse(self.ask("FAN+FA01?", "FAN+FA02?", "FAN+FA03?", timeout=2.5, want=3)))
+        except OSError:
+            return [None, None, None]
+        return [_rpm(d.get(f"FAN+FA0{i}")) for i in (1, 2, 3)]
+
+    def details(self):
+        """Données rangées par catégories (voir classify) + dernière erreur + ventilateurs.
+        Toutes les requêtes partent dans UNE seule conversation : rapide, et la liaison reste libre."""
+        d = {"model": "", "hours": [], "signal": [], "network": [], "versions": [], "other": [], "fans": [], "lse": None}
+        seen = {c: set() for c in ("hours", "signal", "network", "versions", "other")}
+        sst_signal, sig, fans = [], {}, {}
+
+        def add(cat, label, val):
+            if cat == "model":
+                d["model"] = d["model"] or val
+                return
+            k = re.sub(r"\W", "", label.lower())
+            if k not in seen[cat]:
+                seen[cat].add(k)
+                d[cat].append((label, val))
+        cmds = ["ILI?", "FVI?", "ICI?", "SST?", "MIF+RESL?", "MIF+SGFT?", "MIF+VREF?", "LSE?", "FAN+FA01?", "FAN+FA02?", "FAN+FA03?"]
+        msgs = self.ask(*cmds, timeout=6.0, idle=0.5, want=len(cmds))
+        if not msgs:
+            raise OSError("aucune réponse du projecteur")
+        for key, label, val in clean_rows(parse(msgs)):
+            head = key.split("+")[0]
+            if head == "LSE":
+                d["lse"] = _num_name(val)
+            elif head == "FAN":
+                fans[key] = val
+            elif key.startswith("MIF+"):
+                sig[key[4:]] = val
+            else:
+                default = {"ILI": "hours", "FVI": "versions", "ICI": "network"}.get(head)
+                cat = classify(label, val, key)
+                cat = cat if (default is None or cat == "model") else default
+                if cat == "signal" and default is None:
+                    sst_signal.append((label, val))
+                else:
+                    add(cat, label, val)
+        for code, label in (("RESL", "Résolution"), ("SGFT", "Format du signal"), ("VREF", "Fréquence verticale")):
+            if sig.get(code) is not None:
+                d["signal"].append((label, sig[code]))
+        if not d["signal"]:
+            d["signal"] = sst_signal
+        if not d["model"]:  # PIF n'est disponible qu'en mode service : simple essai
+            try:
+                v = dict(parse(self.ask("PIF+MDLN?", timeout=1.5))).get("PIF+MDLN")
+                d["model"] = (v or "").replace('"', "").strip()
+            except OSError:
+                pass
+        d["fans"] = [_rpm(fans.get(f"FAN+FA0{i}")) for i in (1, 2, 3)]
+        return d
 
     def info(self):
         rows = []
