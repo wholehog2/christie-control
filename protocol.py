@@ -1,6 +1,7 @@
 """Protocole série Christie HS (D16/D20-HS) sur TCP, port 3002.
 Format : (CMD) pour une commande, (CMD?) pour une requête, réponse (CMD!valeur)."""
 import re, socket, threading, time
+from contextlib import contextmanager
 
 PORT = 3002
 INPUTS = {1: "VGA", 3: "HDMI 1", 4: "HDMI 2", 5: "DVI-D", 7: "3G-SDI", 8: "HDBaseT"}
@@ -147,14 +148,45 @@ def reply_state(msgs, group):
     return None
 
 
+def _parse_signal(v):
+    """Réponse de MIF+RESL? -> (largeur, hauteur) ; False = pas de signal ; None = indéterminé."""
+    if v is None:
+        return None
+    s = v.replace('"', "")
+    m = re.search(r"(\d{1,5})\s*[x×X*]\s*(\d{1,5})", s) or re.search(r"^\s*(\d{1,5})\s+(\d{1,5})\b", s)
+    if m:
+        w, h = int(m[1]), int(m[2])
+        return (w, h) if w > 0 and h > 0 else False
+    return False if re.search(r"no\s*signal|none|aucun|^\s*0+\s*$", s, re.I) else None
+
+
 class Projector:
     def __init__(self, ip, port=PORT):
         self.ip, self.port = ip, int(port)
         self.bind = None  # IP locale (carte réseau choisie) ou None = automatique
         self.lock = threading.Lock()  # une seule conversation TCP à la fois par VP
+        self._tl = threading.local()
+        self._urg, self._urg_lock = 0, threading.Lock()
 
-    def ask(self, *cmds, timeout=3.0, idle=0.35, quiet=False, want=1):
+    @contextmanager
+    def priority(self):
+        """Actions de l'utilisateur : tant qu'elles sont en cours, les lectures de fond cèdent la place."""
+        with self._urg_lock:
+            self._urg += 1
+        self._tl.on = True
+        try:
+            yield
+        finally:
+            self._tl.on = False
+            with self._urg_lock:
+                self._urg -= 1
+
+    def ask(self, *cmds, timeout=3.0, idle=0.25, quiet=False, want=1):
         """Envoie des commandes, renvoie la liste des messages reçus (sans parenthèses)."""
+        if not getattr(self._tl, "on", False):  # lecture de fond : on laisse passer les actions de l'utilisateur
+            t0 = time.time()
+            while self._urg and time.time() - t0 < 6.0:
+                time.sleep(0.03)
         with self.lock:
             s = socket.create_connection((self.ip, self.port), timeout=timeout,
                                          source_address=(self.bind, 0) if self.bind else None)
@@ -183,13 +215,15 @@ class Projector:
     def source(self):  return _source(self._get("SIN+MAIN?", "SIN+MAIN"))
 
     def state(self):
-        # want=3 : on attend les 3 réponses (le VP peut répondre lentement) ...
-        msgs = self.ask("PWR?", "SHU?", "SIN+MAIN?", want=3)
+        """Alimentation, shutter, source et signal en UNE conversation (rapide, la liaison reste libre)."""
+        msgs = self.ask("PWR?", "SHU?", "SIN+MAIN?", "MIF+RESL?", want=3)
         if not msgs:  # connexion acceptée mais aucune réponse : le VP est injoignable en pratique
             raise OSError("aucune réponse du projecteur")
         d = dict(parse(msgs))
+        pw = _power(d.get("PWR"))
         for cmd, key in (("PWR?", "PWR"), ("SHU?", "SHU"), ("SIN+MAIN?", "SIN+MAIN")):
-            if key not in d:  # ... et on redemande individuellement celles qui manquent
+            # réponse manquante : on la redemande, sauf en veille où shutter et source sont indisponibles
+            if key not in d and (key == "PWR" or pw in (None, "on")):
                 try:
                     v = self._get(cmd, key)
                 except OSError:
@@ -197,8 +231,10 @@ class Projector:
                 if v is not None:
                     d[key] = v
         out = {"pwr": _power(d.get("PWR")), "shu": _shutter(d.get("SHU")), "src": _source(d.get("SIN+MAIN"))}
-        # signal réel sur l'entrée : seulement si le VP est allumé et sur une source identifiée
-        out["sig"] = self.signal() if out["pwr"] == "on" and out["src"] is not None else None
+        if out["pwr"] == "on" and out["src"] is not None:  # signal réellement reçu sur l'entrée
+            out["sig"] = _parse_signal(d["MIF+RESL"]) if "MIF+RESL" in d else self.signal()
+        else:
+            out["sig"] = None
         return out
 
     def _read_num(self, code):
@@ -226,17 +262,9 @@ class Projector:
     def signal(self):
         """Signal réellement reçu : (largeur, hauteur) ; False = pas de signal ; None = indéterminé."""
         try:
-            v = dict(parse(self.ask("MIF+RESL?", timeout=2.0))).get("MIF+RESL")
+            return _parse_signal(dict(parse(self.ask("MIF+RESL?", timeout=2.0))).get("MIF+RESL"))
         except OSError:
             return None
-        if v is None:
-            return None
-        s = v.replace('"', "")
-        m = re.search(r"(\d{1,5})\s*[x×X*]\s*(\d{1,5})", s) or re.search(r"^\s*(\d{1,5})\s+(\d{1,5})\b", s)
-        if m:
-            w, h = int(m[1]), int(m[2])
-            return (w, h) if w > 0 and h > 0 else False
-        return False if re.search(r"no\s*signal|none|aucun|^\s*0+\s*$", s, re.I) else None
 
     def last_error(self):
         """Dernière erreur système (LSE?) : (code, texte) ; code 0 = aucune ; None = illisible."""
@@ -249,7 +277,7 @@ class Projector:
     def fans(self):
         """Vitesse (tr/min) des ventilateurs 1 à 3 : [rpm | None] x 3."""
         try:
-            d = dict(parse(self.ask("FAN+FA01?", "FAN+FA02?", "FAN+FA03?", timeout=2.5, want=3)))
+            d = dict(parse(self.ask("FAN+FA01?", "FAN+FA02?", "FAN+FA03?", timeout=1.5, want=3)))
         except OSError:
             return [None, None, None]
         return [_rpm(d.get(f"FAN+FA0{i}")) for i in (1, 2, 3)]
@@ -270,7 +298,7 @@ class Projector:
                 seen[cat].add(k)
                 d[cat].append((label, val))
         cmds = ["ILI?", "FVI?", "ICI?", "SST?", "MIF+RESL?", "MIF+SGFT?", "MIF+VREF?", "LSE?", "FAN+FA01?", "FAN+FA02?", "FAN+FA03?"]
-        msgs = self.ask(*cmds, timeout=6.0, idle=0.5, want=len(cmds))
+        msgs = self.ask(*cmds, timeout=4.0, idle=0.5, want=len(cmds))
         if not msgs:
             raise OSError("aucune réponse du projecteur")
         for key, label, val in clean_rows(parse(msgs)):

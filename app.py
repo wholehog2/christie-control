@@ -4,7 +4,7 @@ from PySide6.QtCore import QByteArray, QObject, QPointF, QRectF, QSize, QTimer, 
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QGraphicsOpacityEffect, QFrame, QGridLayout,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QPlainTextEdit,
                                QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
                                QMenu, QMessageBox, QVBoxLayout, QWidget)
@@ -215,7 +215,10 @@ class Console(QDialog):
         self.inp.clear()
         self.out.appendPlainText(f"→ ({c})")
         # on attend la réponse (jusqu'à 3,5 s) même pour une écriture : un VP lent répond parfois après 0,5 s
-        bg(lambda: self.p.ask(c, timeout=3.5, idle=0.5),
+        def send_cmd():
+            with self.p.priority():  # la commande de l'utilisateur passe avant les lectures de fond
+                return self.p.ask(c, timeout=3.5, idle=0.5)
+        bg(send_cmd,
            lambda r, e: self.out.appendPlainText(f"✖ {e}" if e else "\n".join(f"← ({m})" for m in r)
                                                  or "(aucune réponse du projecteur dans les 3,5 s)"))
 
@@ -629,6 +632,7 @@ class Card(QFrame):
         self.pwr_timer.timeout.connect(self.refresh_info)
         self.state_lbl = None
         self.data_panel, self.prev_pwr, self.last_details = None, None, None
+        self.again = False  # une actualisation a été demandée pendant une lecture : on la rejoue ensuite
         self.lens_locked, self.lens_btns, self.lens_lock = True, [], None  # boutons d'objectif : verrouillés par défaut
         self.video_folded = False  # automatique : replié quand la source est identifiée, déplié sinon
         self.grid = QGridLayout()
@@ -998,7 +1002,7 @@ class Card(QFrame):
             if nxt is not None and nxt != self.lamp_last:
                 self.lamp_set_silent(nxt)
                 self.lamp_commit()
-        bg(work, done)
+        bg(self.urgent(work), done)
 
     def lamp_set_silent(self, v):
         """Positionne le curseur sans déclencher d'envoi."""
@@ -1649,7 +1653,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             self.paint_ori()
             self.status(f"{self.cfg['name']} · {label} {'activé' if target else 'désactivé'} : "
                         + ("confirmé" if good else f"non confirmé ({err or 'pas de réponse du VP'})"))
-        bg(lambda: self.p.set_and_check(cmd, code, 1 if target else 0), done)
+        bg(self.urgent(lambda: self.p.set_and_check(cmd, code, 1 if target else 0)), done)
 
     def apply_ori(self, d, err):
         if err or not d:
@@ -1698,19 +1702,23 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
                 self.src_key = key
                 self.set_video_folded(True)
             self.status(f"{self.cfg['name']} · {cmd} : " + ("confirmé" if good else f"non confirmé ({err or 'délai dépassé'})"))
-        bg(work, done)
+        bg(self.urgent(work), done)
 
     def refresh(self, full=False):
         if full:
             self.ori_loaded = False  # relire aussi la position du VP
             self.load_info()         # et les données
         if self.busy:
+            self.again = True
             return
         self.busy = True
         bg(self.p.state, self.apply)
 
     def apply(self, st, err):
         self.busy = False
+        if self.again:
+            self.again = False
+            QTimer.singleShot(0, self.refresh)
         s = "err" if err else "ok"
         self.dot.set(s)
         if self.dot_cb:
@@ -1772,6 +1780,13 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             else:
                 self.mark_off()
         self.update_state_lbl()
+
+    def urgent(self, fn):
+        """Exécute fn en priorité sur les lectures de fond (le VP ne traite qu'une conversation à la fois)."""
+        def run():
+            with self.p.priority():
+                return fn()
+        return run
 
     def mark_off(self):
         """VP éteint, en transition ou injoignable : luminosité grisée, ventilateurs à l'arrêt."""
@@ -1864,7 +1879,13 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
 
     def apply_lens_lock(self):
         for b in self.lens_btns:
-            b.setEnabled(not self.lens_locked and not self.main.locked)
+            b.setEnabled(not self.main.locked)  # verrou global : désactivés ; verrou d'objectif : atténués + explication au clic
+            eff = getattr(b, "eff", None)
+            if eff is None:
+                eff = b.eff = QGraphicsOpacityEffect(b)
+                eff.setOpacity(0.45)
+                b.setGraphicsEffect(eff)
+            eff.setEnabled(self.lens_locked)
         lk = self.lens_lock
         if lk is not None:
             lk.setIcon(svg_icon(lock_svg("#8b93a7" if self.lens_locked else "#f59e0b", self.lens_locked)))
@@ -1882,9 +1903,17 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
 
     def lens(self, cmd, btn, label):
         """Commandes d'objectif (LCB+HOME 1 : calibrage, LCB+HOME 0 : centrer le shift)."""
-        if self.main.locked or self.lens_locked:
+        if self.main.locked:
+            self.status("Interface verrouillée : déverrouille pour envoyer une commande")
+            return
+        if self.lens_locked:  # on explique au lieu de ne rien faire
+            self.status(f"{self.cfg['name']} · boutons d'objectif verrouillés : clique d'abord sur le cadenas")
+            self.lens_lock.setProperty("st", "err")
+            repolish(self.lens_lock)
+            QTimer.singleShot(900, self.apply_lens_lock)
             return
         btn.set("busy")
+        self.status(f"{self.cfg['name']} · {label} : envoi de {cmd}…")
 
         def done(msgs, err):
             bad = [m for m in (msgs or []) if "ERR" in m]
@@ -1893,7 +1922,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             self.status(f"{self.cfg['name']} · {label} ({cmd}) : " + ("commande envoyée" if good else f"échec ({err or bad[0]})"))
             if not good:
                 QTimer.singleShot(3000, lambda: self._reset_btn(btn))
-        bg(lambda: self.p.ask(cmd, timeout=1.5, idle=0.4), done)
+        bg(self.urgent(lambda: self.p.ask(cmd, timeout=1.5, idle=0.4)), done)
 
     def load_info(self):
         bg(self.p.details, self.show_details)

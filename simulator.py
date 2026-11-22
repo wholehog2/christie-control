@@ -37,6 +37,7 @@ class SimVP:
         # --- comportements et pannes ---
         self.online, self.silent = True, False       # hors ligne (connexion refusée) / accepte mais ne répond pas
         self.latency_ms, self.max_conn = 0, 0        # délai avant chaque réponse / connexions simultanées (0 = illimité)
+        self.open_on_power = True                    # shutter ouvert à la fin de l'allumage (comme le vrai VP)
         self.reply_state = True                      # répond aux écritures (PWR/SHU/SIN+MAIN) par l'état, ex. (SHU!001)
         self.orient_readable = True                  # CEL? / SOR? répondent-ils ?
         self.nosignal = "0x0"                        # réponse de MIF+RESL? sans signal : « 0x0 », « No Signal » ou « erreur »
@@ -49,7 +50,7 @@ class SimVP:
         with self.lock:
             self._gen += 1
             self.power, self.deadline = "off", None
-            self.shutter, self.source = 1, 3          # shutter fermé, HDMI 1
+            self.shutter, self.source = 0, 3          # shutter ouvert (comme le vrai VP à l'allumage), HDMI 1
             self.ceiling, self.rear = 2, 0            # CEL : 2 = automatique ; SOR : 0 = normal
             self.lamp = {"LPP": 100, "LPI": 100, "BRT": 50}   # puissance de la source, intensité, luminosité (BRT : 50 par défaut)
             self.signals = {k: k in (3, 4, 7) for k in INPUTS}
@@ -90,6 +91,8 @@ class SimVP:
             with self.lock:
                 if gen == self._gen:
                     self.power, self.deadline = nxt, None
+                    if nxt == "on" and self.open_on_power:
+                        self.shutter = 0
                     self.note(f"état : {PWR[nxt][1]}")
         t = threading.Timer(delay, fire)
         t.daemon = True
@@ -443,6 +446,10 @@ def run_gui(args):
             self.rs.setChecked(True)
             self.rs.toggled.connect(lambda on: setattr(vp, "reply_state", on))
             g.addWidget(self.rs, 6, 0, 1, 2)
+            self.op = QCheckBox("Shutter ouvert à l'allumage (comme le vrai VP)")
+            self.op.setChecked(True)
+            self.op.toggled.connect(lambda on: setattr(vp, "open_on_power", on))
+            g.addWidget(self.op, 7, 0, 1, 2)
             g.setColumnStretch(0, 1)
             v.addLayout(g)
 
