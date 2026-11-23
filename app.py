@@ -1870,7 +1870,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
                 bg(self.p.fans, self.apply_fans)
             else:
                 self.mark_off()
-        elif on and self.poll_n % 3 == 0:  # panneau masqué : on surveille quand même les ventilateurs (alertes)
+        elif on:  # panneau masqué : on surveille quand même les ventilateurs à chaque actualisation (alertes)
             bg(self.p.fans, self.apply_fans)
         if not on:
             self.fan_check(None)  # éteint, en transition ou hors ligne : les vitesses ne veulent plus rien dire
@@ -1959,6 +1959,13 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         on = self.last_st is not None and self.last_st.get("pwr") == "on"
         self.fan_check(fans if (on and not err) else None)
 
+    def fan_recheck(self):
+        try:
+            if self.last_st is not None and self.last_st.get("pwr") == "on":
+                bg(self.p.fans, self.apply_fans)
+        except RuntimeError:  # carte supprimée entre-temps
+            pass
+
     FAN_WORDS = {"slow": ("err", "trop lent ou arrêté"), "fast": ("err", "trop rapide"), "high": ("warn", "à une vitesse élevée")}
 
     def fan_check(self, fans):
@@ -1973,6 +1980,8 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             state = (None if v is None else "slow" if v < FAN_LOW else "fast" if v > FAN_AMBER_MAX
                      else "high" if v > FAN_GREEN_MAX else None)
             key = f"fan{i + 1}:" + self.key
+            if v is None and fans:  # mesure manquante (réponse perdue) : ni alerte, ni retour à la normale
+                continue
             if state is None:
                 counts.pop(i, None)
                 self.main.clear_alert(key)
@@ -1980,6 +1989,8 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             prev, n = counts.get(i, (None, 0))
             n = n + 1 if prev == state else 1
             counts[i] = (state, n)
+            if n == 1:  # première mesure anormale : on la confirme tout de suite, sans attendre la prochaine actualisation
+                QTimer.singleShot(1000, self.fan_recheck)
             if n >= 2:
                 level, word = self.FAN_WORDS[state]
                 self.main.set_alert(key, level, f"{self.cfg['name']} : ventilateur {i + 1} {word}")
