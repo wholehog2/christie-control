@@ -13,7 +13,7 @@ jobs:
         include:
           - os: windows-latest
             name: windows
-            extra: --onefile --icon icon.ico
+            extra: --onefile --icon icon.ico --uac-admin   # --uac-admin : droits administrateur, requis pour l'écoute réseau (Npcap)
             out: dist/ChristieControl.exe
           - os: macos-latest        # Apple Silicon (M1/M2/M3...)
             name: macos-apple-silicon
@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: pyinstaller --noconfirm --windowed --name ChristieControl ${{ matrix.extra }} app.py
+      - run: pyinstaller --noconfirm --windowed --name ChristieControl --collect-submodules scapy ${{ matrix.extra }} app.py
       - name: Zip de l'app macOS
         if: runner.os == 'macOS'
         run: ditto -c -k --keepParent dist/ChristieControl.app ${{ matrix.out }}
