@@ -1870,6 +1870,10 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
                 bg(self.p.fans, self.apply_fans)
             else:
                 self.mark_off()
+        elif on and self.poll_n % 3 == 0:  # panneau masqué : on surveille quand même les ventilateurs (alertes)
+            bg(self.p.fans, self.apply_fans)
+        if not on:
+            self.fan_check(None)  # éteint, en transition ou hors ligne : les vitesses ne veulent plus rien dire
         self.update_state_lbl()
 
     # --- échanges d'autres logiciels vus sur le réseau (voir sniffer.py) ---
@@ -1952,6 +1956,33 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
     def apply_fans(self, fans, err):
         if self.data_panel is not None:
             self.data_panel.set_fans([None, None, None] if err else fans)
+        on = self.last_st is not None and self.last_st.get("pwr") == "on"
+        self.fan_check(fans if (on and not err) else None)
+
+    FAN_WORDS = {"slow": ("err", "trop lent ou arrêté"), "fast": ("err", "trop rapide"), "high": ("warn", "à une vitesse élevée")}
+
+    def fan_check(self, fans):
+        """Alertes ventilateurs (seuils FAN_LOW / FAN_GREEN_MAX / FAN_AMBER_MAX). fans = [tr/min | None] x 3, ou None
+        quand les vitesses ne sont pas exploitables. Une alerte n'apparaît qu'après deux relevés consécutifs identiques
+        (pas de fausse alerte sur une mesure isolée) et disparaît dès que la vitesse redevient normale."""
+        counts = getattr(self, "fan_counts", None)
+        if counts is None:
+            counts = self.fan_counts = {}
+        for i in range(3):
+            v = fans[i] if fans else None
+            state = (None if v is None else "slow" if v < FAN_LOW else "fast" if v > FAN_AMBER_MAX
+                     else "high" if v > FAN_GREEN_MAX else None)
+            key = f"fan{i + 1}:" + self.key
+            if state is None:
+                counts.pop(i, None)
+                self.main.clear_alert(key)
+                continue
+            prev, n = counts.get(i, (None, 0))
+            n = n + 1 if prev == state else 1
+            counts[i] = (state, n)
+            if n >= 2:
+                level, word = self.FAN_WORDS[state]
+                self.main.set_alert(key, level, f"{self.cfg['name']} : ventilateur {i + 1} {word}")
 
     # --- compte à rebours, signal, erreurs, verrouillage ---
     def pwr_start(self, target):
