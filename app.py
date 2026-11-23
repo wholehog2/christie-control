@@ -11,7 +11,8 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDia
 from icon_data import ICON_PNG_B64
 import protocol
 from protocol import INPUTS, LSE_TEXT, PORT, Projector, parse, reply_state, wait_for
-from sniffer import NetListener
+import webbrowser
+from sniffer import NPCAP_URL, NetListener, npcap_installed
 from themes import THEMES, qss, shut_qss, slider_qss
 
 # CHRISTIE_CONFIG permet de lancer l'appli avec un autre fichier de réglages (ex. pour le simulateur)
@@ -2379,6 +2380,8 @@ class Main(QMainWindow):
         self.build()
         if LOAD_WARNING:
             QTimer.singleShot(400, self.show_load_warning)
+        if sys.platform == "win32" and self.cfg.get("listen", True) and self.cfg.get("npcap_ask", True) and not npcap_installed():
+            QTimer.singleShot(900, self.offer_npcap)  # après l'affichage de la fenêtre
 
     def set_theme(self, name, save=True):
         # « Sans thème » désactive le QSS global : les looks personnalisés
@@ -2619,6 +2622,26 @@ class Main(QMainWindow):
             self.alert_lay.addWidget(row)
             shown += 1
         self.alert_box.setVisible(shown > 0)
+
+    def offer_npcap(self):
+        """Windows : l'écoute réseau a besoin de Npcap. S'il manque, on propose de l'installer."""
+        box = QMessageBox(QMessageBox.Question, "Npcap n'est pas installé",
+                          "L'écoute du réseau (suivre en direct les ordres envoyés au projecteur par d'autres logiciels) "
+                          "a besoin de Npcap, qui n'est pas installé sur cet ordinateur.\n\n"
+                          "Ouvrir la page de téléchargement de Npcap ? Lance l'installeur, puis relance l'appli.\n"
+                          "(Npcap est gratuit pour un usage personnel ; voir sa licence pour un usage en entreprise.)\n\n"
+                          "Sans Npcap, l'appli fonctionne normalement mais ne voit que ses propres échanges.",
+                          QMessageBox.NoButton, self)
+        yes = box.addButton("Installer Npcap", QMessageBox.AcceptRole)
+        box.addButton("Plus tard", QMessageBox.RejectRole)
+        never = box.addButton("Ne plus demander", QMessageBox.DestructiveRole)
+        box.exec()
+        if box.clickedButton() is yes:
+            webbrowser.open(NPCAP_URL)
+            self.msg.setText("Installe Npcap (laisse « WinPcap API-compatible Mode » coché), puis relance l'appli")
+        elif box.clickedButton() is never:
+            self.cfg["npcap_ask"] = False
+            self.save()
 
     def show_load_warning(self):
         box = QMessageBox(QMessageBox.Warning, "Réglages", LOAD_WARNING, QMessageBox.Ok, self)

@@ -8,10 +8,32 @@ les paquets TCP qui passent par la carte réseau de cet ordinateur. Cela demande
   - que ces paquets arrivent jusqu'à cet ordinateur : sur un switch, il faut une recopie de port (port mirroring)
     vers cet ordinateur, ou que les échanges passent par lui (hub, pont...). Sans cela on ne voit que ses propres échanges.
 """
-import re, threading
+import os, re, sys, threading
 from collections import deque
 
 MSG = re.compile(r"\(([^()]*)\)")
+NPCAP_URL = "https://npcap.com/#download"
+
+
+def npcap_installed():
+    """Windows : Npcap (ou l'ancien WinPcap) est-il installé ? Ailleurs : toujours True (rien à installer)."""
+    if sys.platform != "win32":
+        return True
+    root = os.environ.get("SystemRoot", r"C:\Windows")
+    for f in (("System32", "Npcap", "wpcap.dll"), ("System32", "wpcap.dll")):
+        if os.path.exists(os.path.join(root, *f)):
+            return True
+    try:
+        import winreg
+        for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+            try:
+                winreg.CloseKey(winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Npcap", 0, winreg.KEY_READ | view))
+                return True
+            except OSError:
+                pass
+    except ImportError:
+        pass
+    return False
 
 
 class NetListener:
