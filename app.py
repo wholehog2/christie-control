@@ -1,10 +1,10 @@
 import base64, ipaddress, json, os, re, shutil, sys, threading, time
 from pathlib import Path
-from PySide6.QtCore import QByteArray, QObject, QPointF, QRectF, QSize, QTimer, QVariantAnimation, Qt, Signal
+from PySide6.QtCore import QByteArray, QObject, QPoint, QPointF, QRect, QRectF, QSize, QTimer, QVariantAnimation, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QPainter, QPalette, QPen, QPixmap
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtSvg import QSvgRenderer
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QGraphicsOpacityEffect, QFrame, QGridLayout,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QBoxLayout, QGraphicsOpacityEffect, QFrame, QGridLayout, QLayout, QSpacerItem,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QPlainTextEdit,
                                QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
                                QMenu, QMessageBox, QSizePolicy, QVBoxLayout, QWidget)
@@ -135,6 +135,128 @@ class Led(QWidget):
             p.drawEllipse(0, 0, 16, 16)
         p.setBrush(c)
         p.drawEllipse(4, 4, 8, 8)
+
+
+class FlowLayout(QLayout):
+    """Dispose ses éléments de gauche à droite et passe à la ligne quand la place manque : la fenêtre peut devenir
+    très étroite. addStretch() pousse les éléments suivants vers la droite de leur ligne."""
+
+    def __init__(self, parent=None, hs=10, vs=8):
+        super().__init__(parent)
+        self.items, self.hs, self.vs = [], hs, vs
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self.items.append(item)
+
+    def addStretch(self):
+        self.items.append(QSpacerItem(0, 0))
+        self.items[-1].is_stretch = True
+
+    def count(self):
+        return len(self.items)
+
+    def itemAt(self, i):
+        return self.items[i] if 0 <= i < len(self.items) else None
+
+    def takeAt(self, i):
+        return self.items.pop(i) if 0 <= i < len(self.items) else None
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, w):
+        return self._do(QRect(0, 0, w, 0), True)
+
+    def setGeometry(self, r):
+        super().setGeometry(r)
+        self._do(r, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        m = self.contentsMargins()
+        real = [i for i in self.items if not getattr(i, "is_stretch", False)]
+        w = max([i.minimumSize().width() for i in real] or [0])
+        h = max([i.minimumSize().height() for i in real] or [0])
+        return QSize(w + m.left() + m.right(), h + m.top() + m.bottom())
+
+    def _do(self, rect, test):
+        m = self.contentsMargins()
+        x0, y = rect.x() + m.left(), rect.y() + m.top()
+        avail = max(1, rect.width() - m.left() - m.right())
+        line, used = [], 0  # [(item, w, h)]
+
+        def flush(y):
+            if not line:
+                return y
+            lh = max(h for _, _, h in line)
+            sp = sum(1 for it, _, _ in line if getattr(it, "is_stretch", False))
+            real = [(it, w, h) for it, w, h in line if not getattr(it, "is_stretch", False)]
+            total = sum(w for _, w, _ in real) + self.hs * (len(real) - 1)
+            extra = max(0, avail - total) if sp else 0
+            x = x0
+            for it, w, h in line:
+                if getattr(it, "is_stretch", False):
+                    x += extra
+                    continue
+                if not test:
+                    it.setGeometry(QRect(x, y + (lh - h) // 2, w, h))
+                x += w + self.hs
+            return y + lh + self.vs
+
+        for it in self.items:
+            if getattr(it, "is_stretch", False):
+                line.append((it, 0, 0))
+                continue
+            hint, mn = it.sizeHint(), it.minimumSize()
+            w = max(min(hint.width(), avail), mn.width())
+            h = it.heightForWidth(w) if it.hasHeightForWidth() else hint.height()
+            need = used + (self.hs if used else 0) + w
+            if used and need > avail:
+                y = flush(y)
+                line, used = [], 0
+                need = w
+            line.append((it, w, h))
+            used = need
+        y = flush(y)
+        return y - self.vs + m.bottom() - rect.y() if self.items else m.top() + m.bottom()
+
+
+class CardGrid(QWidget):
+    """Grille de cartes dont le nombre de colonnes s'adapte à la largeur : 2 colonnes si la place le permet, sinon 1."""
+
+    def __init__(self, cards, maxcols):
+        super().__init__()
+        self.cards, self.maxcols, self.cols, self.gap = cards, maxcols, 0, 14
+        self.g = QGridLayout(self)
+        self.g.setContentsMargins(0, 0, 0, 0)
+        self.g.setSpacing(self.gap)
+        self.g.setSizeConstraint(QLayout.SetNoConstraint)
+        self.relayout(maxcols)
+
+    def card_min(self):
+        return max([c.minimumSizeHint().width() for c in self.cards] or [0])
+
+    def minimumSizeHint(self):
+        return QSize(self.card_min(), super().minimumSizeHint().height())
+
+    def relayout(self, cols):
+        if cols == self.cols:
+            return
+        self.cols = cols
+        for r in range(len(self.cards) + 2):
+            self.g.setRowStretch(r, 0)
+        for n, c in enumerate(self.cards):
+            self.g.removeWidget(c)
+            self.g.addWidget(c, n // cols, n % cols)
+        self.g.setRowStretch((len(self.cards) + cols - 1) // cols, 1)  # les cartes restent en haut
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        cm = max(1, self.card_min())
+        self.relayout(max(1, min(self.maxcols, (self.width() + self.gap) // (cm + self.gap))))
 
 
 class ActivityLed(QWidget):
@@ -542,8 +664,23 @@ class DataPanel(QWidget):
             mrow.addWidget(m)
         row.addLayout(mrow)
         v4.addLayout(row, 1)
-        for fr, r, c in ((f1, 0, 0), (f2, 0, 1), (f3, 1, 0), (f4, 1, 1)):
-            g.addWidget(fr, r, c)
+        self.grid, self.blocks, self.one_col = g, (f1, f2, f3, f4), None
+        self.place(False)
+
+    def place(self, one):
+        """Deux colonnes quand il y a de la place, une seule colonne quand le panneau est étroit."""
+        if one == self.one_col:
+            return
+        self.one_col = one
+        for fr in self.blocks:
+            self.grid.removeWidget(fr)
+        for k, fr in enumerate(self.blocks):
+            self.grid.addWidget(fr, k, 0) if one else self.grid.addWidget(fr, k // 2, k % 2)
+        self.grid.setColumnStretch(1, 0 if one else 1)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.place(e.size().width() < 560)
 
     @staticmethod
     def _block(title):
@@ -767,6 +904,19 @@ class Card(QFrame):
         top.addWidget(ip)
         return top
 
+    def responsive_row(self, layout, min_width):
+        """Rangée (QBoxLayout) qui devient une colonne quand la carte est plus étroite que min_width."""
+        if not hasattr(self, "resp_rows"):
+            self.resp_rows = []
+        self.resp_rows.append((layout, min_width))
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        for lay, mw in getattr(self, "resp_rows", []):
+            d = QBoxLayout.LeftToRight if self.width() >= mw else QBoxLayout.TopToBottom
+            if lay.direction() != d:
+                lay.setDirection(d)
+
     def grp(self, title, items, cols=0, vertical=False):
         w = QWidget()
         v = QVBoxLayout(w)
@@ -903,7 +1053,7 @@ class Card(QFrame):
         self.lamp_cols = 3 if compact else 5
         w = QWidget()
         if width:
-            w.setFixedWidth(width)
+            w.setMaximumWidth(width)  # largeur maximale seulement : la carte peut rétrécir
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
         v.setSpacing(6)
@@ -927,8 +1077,7 @@ class Card(QFrame):
         sl.sliderReleased.connect(lambda: self.lamp_commit())  # envoi dès que le curseur est relâché
         self.lamp_sl = sl
         v.addWidget(sl)
-        self.lamp_grid = QGridLayout()
-        self.lamp_grid.setSpacing(6)
+        self.lamp_grid = FlowLayout(hs=6, vs=6)  # les préréglages passent à la ligne si la carte est étroite
         v.addLayout(self.lamp_grid)
         self.lamp_rebuild()
         if framed:
@@ -954,21 +1103,21 @@ class Card(QFrame):
             b.clicked.connect(lambda _=False, val=p: self.lamp_preset(val))
             b.setContextMenuPolicy(Qt.CustomContextMenu)
             b.customContextMenuRequested.connect(lambda pos, val=p, btn=b: self.lamp_chip_menu(btn, pos, val))
-            self.lamp_grid.addWidget(b, i // self.lamp_cols, i % self.lamp_cols)
+            self.lamp_grid.addWidget(b)
         n = len(set(c["presets"]))
         add = QPushButton("+")
         add.setStyleSheet("padding:3px 8px;font-size:12px")
         add.setToolTip("Ajouter la valeur actuelle du curseur comme préréglage")
         add.setEnabled(n < MAX_PRESETS)
         add.clicked.connect(self.lamp_add_preset)
-        self.lamp_grid.addWidget(add, n // self.lamp_cols, n % self.lamp_cols)
+        self.lamp_grid.addWidget(add)
         rm = QPushButton("−")
         rm.setStyleSheet("padding:3px 8px;font-size:12px")
         rm.setToolTip("Supprimer le préréglage correspondant à la valeur actuelle du curseur")
         rm.setEnabled(cur in c["presets"])
         rm.clicked.connect(lambda: self.lamp_del_preset(self.lamp_sl.value()))
         self.lamp_rm = rm
-        self.lamp_grid.addWidget(rm, (n + 1) // self.lamp_cols, (n + 1) % self.lamp_cols)
+        self.lamp_grid.addWidget(rm)
 
     def lamp_chip_menu(self, btn, pos, val):
         m = QMenu(btn)
@@ -1107,15 +1256,14 @@ class Card(QFrame):
         """Panneau Entrée vidéo repliable, commun aux cinq présentations."""
         body = QWidget()
         if cols:
-            layout = QGridLayout(body)
-            layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(8)
-            for i, item in enumerate(items):
-                layout.addWidget(item, i // cols, i % cols)
+            layout = FlowLayout(body, hs=8, vs=8)  # autant de boutons par ligne que la largeur le permet
+            for item in items:
+                layout.addWidget(item)
         else:
-            layout = QVBoxLayout(body) if vertical else QHBoxLayout(body)
+            layout = QVBoxLayout(body) if vertical else FlowLayout(body, hs=6, vs=6)
             layout.setContentsMargins(0, 0, 0, 0)
-            layout.setSpacing(6)
+            if vertical:
+                layout.setSpacing(6)
             for item in items:
                 layout.addWidget(item)
 
@@ -1189,16 +1337,17 @@ class Card(QFrame):
         v = QVBoxLayout(self)
         v.setContentsMargins(18, 14, 18, 12)
         v.setSpacing(8)
-        h = QHBoxLayout()
-        h.setSpacing(22)
+        h = FlowLayout(hs=22, vs=10)  # les blocs passent à la ligne quand la fenêtre est étroite
         ident = QWidget()
-        ident.setFixedWidth(150)
+        ident.setMinimumWidth(130)
         ident.setLayout(self.title(16, True))
         h.addWidget(ident)
         h.addWidget(self.grp("Alimentation", [self.F("pwr", "on", "Allumer"), self.F("pwr", "off", "Éteindre")]))
         h.addWidget(self.grp("Shutter", [self.F("shu", "open", "Ouvrir"), self.F("shu", "closed", "Fermer")]))
         h.addStretch()
-        h.addLayout(self.bar(vertical=True))
+        barbox = QWidget()
+        barbox.setLayout(self.bar(vertical=True))
+        h.addWidget(barbox)
         v.addLayout(h)
         v.addWidget(self.reglages(self.lamp_panel(width=420), self.video_panel([self.F("src", i, INPUTS[i]) for i in self.ins], cols=3), self.ori_panel(compact=True)))
         self.strip = QLabel("Données : …")
@@ -1427,6 +1576,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         v.addLayout(self.title(22))
         body = QHBoxLayout()
         body.setSpacing(16)
+        self.responsive_row(body, 620)  # commandes au-dessus des réglages quand la carte est étroite
 
         left = QFrame()
         left.setObjectName("pane")
@@ -1676,21 +1826,25 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             l1.addWidget(pv, 0, Qt.AlignHCenter)
             l1.addLayout(btns1)
         else:
-            row1 = QHBoxLayout()
-            row1.setSpacing(14)
-            row1.addWidget(pv, 0, Qt.AlignVCenter)
-            row1.addLayout(btns1, 1)
+            b1box = QWidget()
+            b1box.setLayout(btns1)
+            btns1.setContentsMargins(0, 0, 0, 0)
+            row1 = FlowLayout(hs=14, vs=8)  # l'aperçu passe au-dessus des boutons si la carte est étroite
+            row1.addWidget(pv)
+            row1.addWidget(b1box)
             l1.addLayout(row1)
 
         f2, l2 = block("Objectif")  # deux boutons + petit bouton de verrouillage
-        row = QHBoxLayout()
-        row.setSpacing(8)
         btns = QVBoxLayout()
         btns.setSpacing(8)
+        btns.setContentsMargins(0, 0, 0, 0)
         btns.addWidget(bc)
         btns.addWidget(bs)
-        row.addLayout(btns, 1)
-        row.addWidget(lk, 0, Qt.AlignVCenter)
+        bbox = QWidget()
+        bbox.setLayout(btns)
+        row = FlowLayout(hs=8, vs=8)
+        row.addWidget(bbox)
+        row.addWidget(lk)
         l2.addLayout(row)
 
         body = QWidget()
@@ -1701,14 +1855,11 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
             l.addWidget(f1)
             l.addWidget(f2)
         else:
-            l = QHBoxLayout(body)
-            l.setContentsMargins(0, 0, 0, 0)
-            l.setSpacing(28)  # grand espace entre les deux catégories
-            l.addWidget(f1, 3)
-            l.addWidget(f2, 2)
+            l = FlowLayout(body, hs=28, vs=22)  # grand espace entre les deux catégories ; l'une sous l'autre si étroit
+            l.addWidget(f1)
+            l.addWidget(f2)
             for b in (b1, b2, bc, bs):
                 b.setMaximumWidth(250)
-            l.addStretch(1)
         self.apply_lens_lock()
         self.paint_ori()
         if framed:
@@ -2348,7 +2499,7 @@ class Main(QMainWindow):
         self.setCentralWidget(root)
         v = QVBoxLayout(root)
         v.setContentsMargins(22, 18, 22, 12)
-        top = QHBoxLayout()
+        top = FlowLayout(hs=10, vs=8)  # passe à la ligne quand la fenêtre est étroite
         t = QLabel("Projecteurs")
         t.setObjectName("title")
         self.theme = QComboBox()
@@ -2377,30 +2528,36 @@ class Main(QMainWindow):
         self.lock_btn.setCheckable(True)
         self.lock_btn.setToolTip("Verrouille toutes les commandes pour éviter un clic malheureux")
         self.lock_btn.toggled.connect(self.toggle_lock)
-        top.addWidget(t)
-        top.addSpacing(12)
-        top.addWidget(self.grp_btn)
-        top.addWidget(self.lock_btn)
-        top.addStretch()
+        def pair(*ws):
+            """Éléments qui restent toujours ensemble (étiquette + liste, voyant + nom)."""
+            box = QWidget()
+            hl = QHBoxLayout(box)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.setSpacing(6)
+            for w in ws:
+                hl.addWidget(w)
+            return box
+
+        def small(text):
+            lb = QLabel(text)
+            lb.setObjectName("sub")
+            return lb
         self.tx_led = ActivityLed("#3b82f6", "Envoi : l'appli envoie une commande à un projecteur")
         self.rx_led = ActivityLed("#22c55e", "Réception : des données arrivent d'un projecteur")
         self.listen_lbl = QLabel()
         self.listen_lbl.setObjectName("sub")
-        top.addWidget(self.listen_lbl)
-        top.addSpacing(6)
-        for led, name in ((self.tx_led, "Env."), (self.rx_led, "Réc.")):
-            lb = QLabel(name)
-            lb.setObjectName("sub")
-            top.addWidget(led)
-            top.addWidget(lb)
-        top.addSpacing(10)
         # branchement des voyants : envois / réceptions de l'appli (protocol.py) et échanges vus sur le réseau
         protocol.ACTIVITY["tx"] = lambda: relay.call.emit(self.tx_led.flash)
         protocol.ACTIVITY["rx"] = lambda: relay.call.emit(self.rx_led.flash)
-        top.addWidget(QLabel("Look"))
-        top.addWidget(self.look)
-        top.addWidget(QLabel("Thème"))
-        top.addWidget(self.theme)
+        top.addWidget(t)
+        top.addWidget(self.grp_btn)
+        top.addWidget(self.lock_btn)
+        top.addStretch()
+        top.addWidget(self.listen_lbl)
+        top.addWidget(pair(self.tx_led, small("Env.")))
+        top.addWidget(pair(self.rx_led, small("Réc.")))
+        top.addWidget(pair(QLabel("Look"), self.look))
+        top.addWidget(pair(QLabel("Thème"), self.theme))
         top.addWidget(rf)
         top.addWidget(st)
         v.addLayout(top)
@@ -2415,6 +2572,7 @@ class Main(QMainWindow):
         v.addWidget(self.area, 1)
         self.msg = QLabel(f"Prêt · réglages : {CFG}")
         self.msg.setObjectName("sub")
+        self.msg.setWordWrap(True)  # un long message passe à la ligne au lieu d'imposer une largeur minimale
         v.addWidget(self.msg)
         self.timer = QTimer(self)
         self.timer.timeout.connect(lambda: (self.sync_net(), [c.refresh() for c in self.cards]))
@@ -2480,12 +2638,13 @@ class Main(QMainWindow):
         valid = {c.key for c in self.cards}  # alertes : on oublie celles des projecteurs supprimés
         self.alerts = {k: v for k, v in self.alerts.items() if k.split(":", 1)[1] in valid}
         self.render_alerts()
-        self.side_frame = None
+        self.side_frame, self.side_lay = None, None
         h = QWidget()
         if look == "side":
             lay = QHBoxLayout(h)
             lay.setContentsMargins(0, 0, 0, 0)
             lay.setSpacing(16)
+            self.side_lay = lay
             side = QFrame()
             side.setObjectName("card")
             side.setFixedWidth(240)
@@ -2512,22 +2671,16 @@ class Main(QMainWindow):
             lay.addWidget(stack, 1)
             if items:
                 pick(0)
+            self.adapt_side()
         else:
-            g = QGridLayout(h)
-            g.setSpacing(14)
-            positions = {"classic": (lambda n: (n // 2, n % 2)),
-                         "console": (lambda n: (n, 0)),
-                         "tiles": (lambda n: (n // 2, n % 2)),
-                         "mixer": (lambda n: (0, n))}
-            position = positions.get(look, positions["classic"])
-            for n, c in enumerate(self.cards):
-                g.addWidget(c, *position(n))
-            if look == "mixer":
+            if look == "mixer":  # les bandes du mixeur restent côte à côte
+                g = QGridLayout(h)
+                g.setSpacing(14)
+                for n, c in enumerate(self.cards):
+                    g.addWidget(c, 0, n)
                 g.setColumnStretch(len(self.cards), 1)
-            elif look in ("classic", "tiles") or look not in ("console", "side"):
-                g.setRowStretch(len(self.cards) // 2 + 1, 1)
-            else:
-                g.setRowStretch(len(self.cards), 1)
+            else:  # 1 colonne (console) ou 2 colonnes qui passent à 1 quand la fenêtre est étroite
+                h = CardGrid(self.cards, 1 if look == "console" else 2)
         self.area.setWidget(h)
         self.timer.stop()
         if self.cfg["poll"] > 0:
@@ -2577,6 +2730,23 @@ class Main(QMainWindow):
         self.set_listen_status(None)
         self.listener = NetListener(by_addr, is_own, on_msgs, on_status)
         self.listener.start()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self.adapt_side()
+
+    def adapt_side(self):
+        """Look « latéral » : la liste des projecteurs passe au-dessus de la carte quand la fenêtre est étroite."""
+        lay, side = getattr(self, "side_lay", None), self.side_frame
+        if lay is None or side is None:
+            return
+        try:
+            narrow = self.width() < 760
+            lay.setDirection(QBoxLayout.TopToBottom if narrow else QBoxLayout.LeftToRight)
+            side.setMaximumWidth(16777215 if narrow else 240)
+            side.setMinimumWidth(0 if narrow else 240)
+        except RuntimeError:  # widget supprimé (changement de look)
+            self.side_lay = None
 
     def closeEvent(self, e):
         if getattr(self, "listener", None) is not None:
