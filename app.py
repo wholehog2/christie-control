@@ -7,15 +7,17 @@ from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QGraphicsOpacityEffect, QFrame, QGridLayout,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QPlainTextEdit,
                                QPushButton, QScrollArea, QSlider, QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem,
-                               QMenu, QMessageBox, QVBoxLayout, QWidget)
+                               QMenu, QMessageBox, QSizePolicy, QVBoxLayout, QWidget)
 from icon_data import ICON_PNG_B64
-from protocol import INPUTS, LSE_TEXT, PORT, Projector, reply_state, wait_for
+import protocol
+from protocol import INPUTS, LSE_TEXT, PORT, Projector, parse, reply_state, wait_for
+from sniffer import NetListener
 from themes import THEMES, qss, shut_qss, slider_qss
 
 # CHRISTIE_CONFIG permet de lancer l'appli avec un autre fichier de réglages (ex. pour le simulateur)
 CFG = Path(os.environ["CHRISTIE_CONFIG"]).expanduser() if os.environ.get("CHRISTIE_CONFIG") else Path.home() / ".christie_control.json"
 BAK = CFG.with_name(CFG.name + ".bak")
-DEFAULT = {"theme": "Sombre", "poll": 5, "confirm_off": True, "stagger": 2,
+DEFAULT = {"theme": "Sombre", "poll": 5, "confirm_off": True, "stagger": 2, "listen": True,
            "projectors": [{"name": "VP 1", "ip": "192.168.0.10", "port": PORT, "inputs": list(INPUTS)}]}
 LOAD_WARNING = ""
 
@@ -132,6 +134,48 @@ class Led(QWidget):
             p.drawEllipse(0, 0, 16, 16)
         p.setBrush(c)
         p.drawEllipse(4, 4, 8, 8)
+
+
+class ActivityLed(QWidget):
+    """Voyant d'activité : s'allume un court instant à chaque passage de données, puis s'éteint en fondu."""
+
+    def __init__(self, color, tip):
+        super().__init__()
+        self.color, self.level = QColor(color), 0.0
+        self.setFixedSize(16, 16)
+        self.setToolTip(tip)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._fade)
+
+    def flash(self):
+        self.level = 1.0
+        if not self.timer.isActive():
+            self.timer.start(30)
+        self.update()
+
+    def _fade(self):
+        self.level = max(0.0, self.level - 0.12)
+        if self.level == 0.0:
+            self.timer.stop()
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        off = QColor(self.color)
+        off.setAlpha(60)  # éteint : couleur très atténuée, pour qu'on sache laquelle est laquelle
+        p.setBrush(off)
+        p.drawEllipse(4, 4, 8, 8)
+        if self.level > 0:
+            g = QColor(self.color)
+            g.setAlpha(int(90 * self.level))
+            p.setBrush(g)
+            p.drawEllipse(0, 0, 16, 16)
+            on = QColor(self.color)
+            on.setAlpha(int(255 * self.level))
+            p.setBrush(on)
+            p.drawEllipse(4, 4, 8, 8)
 
 
 class Func(QWidget):
@@ -373,9 +417,19 @@ def lock_svg(c, closed):
             f'stroke-width="4" stroke-linecap="round"/><rect x="10" y="22" width="28" height="20" rx="4" fill="{c}"/></svg>')
 
 
+# Vitesses des ventilateurs (tr/min) pour les couleurs du vumètre.
+# Christie ne publie pas de vitesse nominale pour le D20HD-HS ; ces valeurs viennent des seuils d'alerte du manuel
+# de service HS 2K (alerte « ventilateur trop lent » entre ~1 960 et ~2 870 tr/min selon le ventilateur, soit
+# environ 75 % de la vitesse normale) et sont à ajuster d'après les valeurs lues sur ton projecteur.
+FAN_LOW = 2000        # en dessous : ventilateur trop lent (valeur affichée en rouge)
+FAN_GREEN_MAX = 4200  # jusqu'ici : fonctionnement normal (vert)
+FAN_AMBER_MAX = 4800  # jusqu'ici : élevé (orange) ; au-dessus : trop rapide (rouge)
+
+
 class VuMeter(QWidget):
     """Vumètre à segments (ventilateur) : vert → ambre → rouge, repère de crête, valeur animée."""
-    SEG = 12
+    SEG = 12   # nombre minimal de barres
+    BAR = 4    # hauteur visée d'une barre (px) : le nombre de barres s'adapte à la hauteur
 
     def __init__(self, name):
         super().__init__()
@@ -383,7 +437,8 @@ class VuMeter(QWidget):
         self.anim = QVariantAnimation(self)
         self.anim.setDuration(450)
         self.anim.valueChanged.connect(self._tick)
-        self.setFixedSize(50, 150)
+        self.setMinimumSize(54, 150)  # la hauteur s'adapte à la catégorie (valeur en haut, nom en bas)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
 
     def _tick(self, v):
         self.shown = float(v)
@@ -399,37 +454,46 @@ class VuMeter(QWidget):
         self.anim.setStartValue(self.shown)
         self.anim.setEndValue(float(v or 0))
         self.anim.start()
-        self.setToolTip(f"{self.name} : {v} tr/min" if v is not None else f"{self.name} : pas de mesure")
+        if v is None:
+            tip = f"{self.name} : pas de mesure"
+        else:
+            etat = ("arrêté ou trop lent" if v < FAN_LOW else "normal" if v <= FAN_GREEN_MAX
+                    else "élevé" if v <= FAN_AMBER_MAX else "très élevé")
+            tip = f"{self.name} : {v} tr/min ({etat})"
+        self.setToolTip(tip)
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         txt = self.palette().color(QPalette.WindowText)  # couleur de texte du thème
-        w, h, n, gap, top, bot = self.width(), self.height(), self.SEG, 3, 20, 18
+        w, h, gap, top, bot = self.width(), self.height(), 2, 20, 18
+        n = max(self.SEG, int((h - top - bot + gap) // (self.BAR + gap)))  # plus le vumètre est haut, plus il a de barres
         sh = (h - top - bot - gap * (n - 1)) / n
         lit = round(min(1.0, self.shown / self.vmax) * n) if self.vmax else 0
         peak_i = round(min(1.0, self.peak / self.vmax) * n) if (self.value is not None and self.vmax) else 0
         for i in range(n):  # i = 0 en bas
             y = top + (n - 1 - i) * (sh + gap)
-            t = i / (n - 1)
-            col = QColor(34, 197, 94) if t < 0.6 else QColor(245, 158, 11) if t < 0.85 else QColor(239, 68, 68)
+            top_rpm = (i + 1) / n * self.vmax  # vitesse atteinte quand ce segment est allumé
+            col = (QColor(34, 197, 94) if top_rpm <= FAN_GREEN_MAX
+                   else QColor(245, 158, 11) if top_rpm <= FAN_AMBER_MAX else QColor(239, 68, 68))
             if i >= lit:
                 col = QColor(txt)
                 col.setAlpha(38)
             p.setPen(Qt.NoPen)
             p.setBrush(col)
-            p.drawRoundedRect(QRectF(7, y, w - 14, sh), 2.5, 2.5)
+            p.drawRoundedRect(QRectF(7, y, w - 14, sh), min(2.5, sh / 2), min(2.5, sh / 2))
             if peak_i - 1 == i and peak_i > lit:  # repère de crête
                 pk = QColor(txt)
                 pk.setAlpha(170)
                 p.setPen(QPen(pk, 1.3))
                 p.setBrush(Qt.NoBrush)
-                p.drawRoundedRect(QRectF(7, y, w - 14, sh), 2.5, 2.5)
+                p.drawRoundedRect(QRectF(7, y, w - 14, sh), min(2.5, sh / 2), min(2.5, sh / 2))
         f = QFont()
         f.setPixelSize(11)
         f.setBold(True)
         p.setFont(f)
-        p.setPen(txt)
+        slow = self.value is not None and self.value < FAN_LOW
+        p.setPen(QColor(239, 68, 68) if slow else txt)
         p.drawText(QRectF(0, 0, w, top - 2), Qt.AlignCenter, f"{int(self.value):,}".replace(",", " ") if self.value is not None else "—")
         f.setBold(False)
         f.setPixelSize(10)
@@ -465,14 +529,18 @@ class DataPanel(QWidget):
         f4, v4, self.r4 = self._block("Versions et ventilateurs")
         row = QHBoxLayout()
         row.setSpacing(8)
-        row.addLayout(self.r4, 1)
+        left = QVBoxLayout()  # la liste des versions reste en haut, les vumètres prennent toute la hauteur
+        left.setSpacing(0)
+        left.addLayout(self.r4)
+        left.addStretch()
+        row.addLayout(left, 1)
         self.meters = [VuMeter(f"FAN {i}") for i in (1, 2, 3)]
         mrow = QHBoxLayout()
         mrow.setSpacing(0)
         for m in self.meters:
             mrow.addWidget(m)
         row.addLayout(mrow)
-        v4.addLayout(row)
+        v4.addLayout(row, 1)
         for fr, r, c in ((f1, 0, 0), (f2, 0, 1), (f3, 1, 0), (f4, 1, 1)):
             g.addWidget(fr, r, c)
 
@@ -632,6 +700,7 @@ class Card(QFrame):
         self.pwr_timer.timeout.connect(self.refresh_info)
         self.state_lbl = None
         self.data_panel, self.prev_pwr, self.last_details = None, None, None
+        self.data_dialog = None  # look Mixeur : les données s'affichent dans une fenêtre
         self.again = False  # une actualisation a été demandée pendant une lecture : on la rejoue ensuite
         self.lens_locked, self.lens_btns, self.lens_lock = True, [], None  # boutons d'objectif : verrouillés par défaut
         self.video_folded = False  # automatique : replié quand la source est identifiée, déplié sinon
@@ -717,11 +786,11 @@ class Card(QFrame):
             v.addLayout(l)
         return w
 
-    def bar(self, full=True, vertical=False):
+    def bar(self, full=True, vertical=False, data_cb=None):
         h = QVBoxLayout() if vertical else QHBoxLayout()
         if full:
             b1 = QPushButton("Données")
-            b1.clicked.connect(self.load_info)
+            b1.clicked.connect(data_cb or self.load_info)
             h.addWidget(b1)
         b2 = QPushButton("Console")
         b2.clicked.connect(lambda: Console(self.p, self.cfg["name"], self.main).show())
@@ -1188,7 +1257,15 @@ class Card(QFrame):
         self.lcd.setObjectName("lcd")
         self.lcd.setAlignment(Qt.AlignCenter)
         v.addWidget(self.lcd)
-        v.addLayout(self.bar())
+        self.data_dialog = QDialog(self)  # le Mixeur est trop étroit pour le panneau : il s'ouvre à part
+        self.data_dialog.setWindowTitle(f"Données — {self.cfg['name']}")
+        self.data_dialog.resize(820, 540)
+        dl = QVBoxLayout(self.data_dialog)
+        dl.setContentsMargins(16, 16, 16, 16)
+        self.data_panel = DataPanel()
+        dl.addWidget(self.data_panel)
+        dl.addStretch()
+        v.addLayout(self.bar(data_cb=self.open_data))
 
     # --- cinq variantes graphiques supplémentaires ---
     def skin(self, palette):
@@ -1578,18 +1655,33 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         cap.setToolTip(tip)
         pl.addWidget(cap)
 
-        c1 = QWidget()  # colonne « position »
-        l1 = QVBoxLayout(c1)
-        l1.setContentsMargins(0, 0, 0, 0)
-        l1.setSpacing(8)
-        l1.addWidget(self.cap("Position du projecteur"))
-        l1.addWidget(b1)
-        l1.addWidget(b2)
-        c2 = QWidget()  # colonne « objectif » : deux boutons + petit bouton de verrouillage
-        l2 = QVBoxLayout(c2)
-        l2.setContentsMargins(0, 0, 0, 0)
-        l2.setSpacing(8)
-        l2.addWidget(self.cap("Objectif"))
+        def block(title):
+            """Catégorie encadrée avec son titre, comme « Réseau » ou « Signal d'entrée »."""
+            fr = QFrame()
+            fr.setObjectName("pane")
+            lay = QVBoxLayout(fr)
+            m = 8 if vertical else 12
+            lay.setContentsMargins(m, 10, m, 10)
+            lay.setSpacing(8)
+            lay.addWidget(self.cap(title))
+            return fr, lay
+
+        f1, l1 = block("Position du projecteur")
+        btns1 = QVBoxLayout()
+        btns1.setSpacing(8)
+        btns1.addWidget(b1)
+        btns1.addWidget(b2)
+        if vertical:
+            l1.addWidget(pv, 0, Qt.AlignHCenter)
+            l1.addLayout(btns1)
+        else:
+            row1 = QHBoxLayout()
+            row1.setSpacing(14)
+            row1.addWidget(pv, 0, Qt.AlignVCenter)
+            row1.addLayout(btns1, 1)
+            l1.addLayout(row1)
+
+        f2, l2 = block("Objectif")  # deux boutons + petit bouton de verrouillage
         row = QHBoxLayout()
         row.setSpacing(8)
         btns = QVBoxLayout()
@@ -1604,17 +1696,15 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
         if vertical:
             l = QVBoxLayout(body)
             l.setContentsMargins(0, 0, 0, 0)
-            l.setSpacing(10)
-            l.addWidget(pv, 0, Qt.AlignHCenter)
-            l.addWidget(c1)
-            l.addWidget(c2)
+            l.setSpacing(22)  # grand espace entre les deux catégories
+            l.addWidget(f1)
+            l.addWidget(f2)
         else:
             l = QHBoxLayout(body)
             l.setContentsMargins(0, 0, 0, 0)
-            l.setSpacing(14)
-            l.addWidget(pv, 0, Qt.AlignVCenter)
-            l.addWidget(c1, 1)
-            l.addWidget(c2, 1)
+            l.setSpacing(28)  # grand espace entre les deux catégories
+            l.addWidget(f1, 3)
+            l.addWidget(f2, 2)
             for b in (b1, b2, bc, bs):
                 b.setMaximumWidth(250)
             l.addStretch(1)
@@ -1774,12 +1864,72 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
                 bg(self.read_lamp, self.apply_lamp)
             else:
                 self.mark_off()
-        if self.data_panel is not None and not self.folded:  # vumètres des ventilateurs
+        if self.data_panel is not None and self.data_visible():  # vumètres des ventilateurs
             if on:
                 bg(self.p.fans, self.apply_fans)
             else:
                 self.mark_off()
         self.update_state_lbl()
+
+    # --- échanges d'autres logiciels vus sur le réseau (voir sniffer.py) ---
+    SET_CMD = re.compile(r"^#?([A-Za-z]{3})(?:\+[A-Za-z0-9]{4})?(?![A-Za-z0-9+])\s*[^?\s]")
+
+    def on_remote(self, from_vp, msgs):
+        """Messages échangés entre le VP et un autre logiciel. Une réponse du VP (ex. (SHU!001)) met l'état à jour
+        tout de suite ; un ordre d'un autre logiciel déclenche en plus une relecture complète quelques instants après."""
+        if self.last_st is None:  # VP encore inconnu ou hors ligne : la prochaine actualisation s'en charge
+            return
+        recheck = False
+        if from_vp:
+            st, pwr_changed, changed = dict(self.last_st), False, False
+            for g in ("pwr", "shu", "src"):
+                v = reply_state(msgs, g)
+                if v is not None and v != st.get(g):
+                    st[g], changed = v, True
+                    pwr_changed = pwr_changed or g == "pwr"
+            if changed:
+                self.apply_remote_state(st)
+                recheck = True
+        else:
+            recheck = any(self.SET_CMD.match(m) for m in msgs)  # ordre (pas une simple requête « ? »)
+        if recheck:
+            self.remote_refresh(full=any(re.match(r"^#?(CEL|SOR|BRT|LPP|LPM|PWR)\b", m, re.I) for m in msgs))
+
+    def apply_remote_state(self, st):
+        """Même rendu que apply() pour les boutons, mais à partir d'une réponse vue sur le réseau."""
+        self.last_st = st
+        on = st["pwr"] == "on"
+        for g in self.groups:
+            if g in self.pending:
+                continue
+            val = st.get(g)
+            if g in ("shu", "src") and not on:
+                val = None
+            self.led(g, val, "ok")
+        if "src" not in self.pending:
+            self.sync_video(st.get("src") if on else None)
+        if not on:
+            self.on_signal(None)
+            self.mark_off()
+        self.update_state_lbl()
+        name = self.cfg["name"]
+        self.status(f"{name} : changement fait par un autre logiciel (état mis à jour)")
+
+    def remote_refresh(self, full=False):
+        """Relecture complète peu après un ordre venu d'ailleurs (regroupe les rafales d'ordres)."""
+        t = getattr(self, "remote_timer", None)
+        if t is None:
+            t = self.remote_timer = QTimer(self)
+            t.setSingleShot(True)
+            t.timeout.connect(self._remote_refresh_now)
+        self.remote_full = getattr(self, "remote_full", False) or full
+        t.start(400)
+
+    def _remote_refresh_now(self):
+        full, self.remote_full = self.remote_full, False
+        if full:
+            self.ori_loaded = False  # position (plafond / rétro) et luminosité sont relues avec l'état
+        self.refresh()
 
     def urgent(self, fn):
         """Exécute fn en priorité sur les lectures de fond (le VP ne traite qu'une conversation à la fois)."""
@@ -1924,6 +2074,26 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
                 QTimer.singleShot(3000, lambda: self._reset_btn(btn))
         bg(self.urgent(lambda: self.p.ask(cmd, timeout=1.5, idle=0.4)), done)
 
+    def data_visible(self):
+        """Le panneau de données est-il à l'écran ? (sinon on n'interroge pas les ventilateurs pour rien)"""
+        if self.data_dialog is not None:
+            return self.data_dialog.isVisible()
+        return not self.folded
+
+    def open_data(self):
+        """Look Mixeur : ouvre la fenêtre des données (modèle, heures, signal, réseau, versions, ventilateurs)."""
+        dlg = self.data_dialog
+        if dlg is None:
+            return
+        if self.last_details is not None:
+            self.data_panel.set_data(self.last_details)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+        self.load_info()
+        if self.last_st and self.last_st.get("pwr") == "on":
+            bg(self.p.fans, self.apply_fans)
+
     def load_info(self):
         bg(self.p.details, self.show_details)
 
@@ -2018,6 +2188,10 @@ class Settings(QDialog):
         self.confirm = QCheckBox("Demander confirmation avant d'éteindre un projecteur")
         self.confirm.setChecked(cfg.get("confirm_off", True))
         v.addWidget(self.confirm)
+        self.listen = QCheckBox("Écouter le réseau : suivre en direct les ordres envoyés au projecteur par d'autres logiciels "
+                                "(demande scapy + Npcap sous Windows, droits administrateur)")
+        self.listen.setChecked(cfg.get("listen", True))
+        v.addWidget(self.listen)
         n = QHBoxLayout()
         n.addWidget(QLabel("Carte réseau"))
         self.iface = QComboBox()
@@ -2165,6 +2339,21 @@ class Main(QMainWindow):
         top.addWidget(self.grp_btn)
         top.addWidget(self.lock_btn)
         top.addStretch()
+        self.tx_led = ActivityLed("#3b82f6", "Envoi : l'appli envoie une commande à un projecteur")
+        self.rx_led = ActivityLed("#22c55e", "Réception : des données arrivent d'un projecteur")
+        self.listen_lbl = QLabel()
+        self.listen_lbl.setObjectName("sub")
+        top.addWidget(self.listen_lbl)
+        top.addSpacing(6)
+        for led, name in ((self.tx_led, "Env."), (self.rx_led, "Réc.")):
+            lb = QLabel(name)
+            lb.setObjectName("sub")
+            top.addWidget(led)
+            top.addWidget(lb)
+        top.addSpacing(10)
+        # branchement des voyants : envois / réceptions de l'appli (protocol.py) et échanges vus sur le réseau
+        protocol.ACTIVITY["tx"] = lambda: relay.call.emit(self.tx_led.flash)
+        protocol.ACTIVITY["rx"] = lambda: relay.call.emit(self.rx_led.flash)
         top.addWidget(QLabel("Look"))
         top.addWidget(self.look)
         top.addWidget(QLabel("Thème"))
@@ -2301,6 +2490,53 @@ class Main(QMainWindow):
         self.sync_net(True)
         for c in self.cards:
             c.refresh()
+        self.start_listener()
+
+    # --- écoute du réseau : ordres envoyés au VP par d'autres logiciels ---
+    def set_listen_status(self, ok, text=""):
+        if not self.cfg.get("listen", True):
+            self.listen_lbl.setText("Écoute réseau : désactivée")
+            self.listen_lbl.setToolTip("Réglable dans Paramètres")
+        elif ok is None:
+            self.listen_lbl.setText("Écoute réseau : démarrage…")
+        elif ok:
+            self.listen_lbl.setText('<span style="color:#22c55e">●</span> Écoute réseau')
+            self.listen_lbl.setToolTip(text)
+        else:
+            self.listen_lbl.setText('<span style="color:#f59e0b">●</span> Écoute réseau indisponible')
+            self.listen_lbl.setToolTip(text + "\n\nL'appli continue de suivre le projecteur par actualisation automatique.")
+            self.msg.setText("Écoute réseau indisponible : " + text)
+
+    def start_listener(self):
+        old = getattr(self, "listener", None)
+        if old is not None:
+            old.stop()
+        self.listener = None
+        if not self.cfg.get("listen", True) or not self.cards:
+            self.set_listen_status(None)
+            return
+        by_addr = {(c.cfg["ip"], int(c.cfg.get("port", PORT))): c for c in self.cards}
+        cards = list(self.cards)
+
+        def is_own(client):
+            return any(client in c.p.own for c in cards)
+
+        def on_msgs(addr, from_vp, msgs):
+            relay.call.emit((self.rx_led if from_vp else self.tx_led).flash)
+            card = by_addr.get(addr)
+            if card is not None:
+                relay.call.emit(lambda: card.on_remote(from_vp, msgs))
+
+        def on_status(ok, text):
+            relay.call.emit(lambda: self.set_listen_status(ok, text))
+        self.set_listen_status(None)
+        self.listener = NetListener(by_addr, is_own, on_msgs, on_status)
+        self.listener.start()
+
+    def closeEvent(self, e):
+        if getattr(self, "listener", None) is not None:
+            self.listener.stop()
+        super().closeEvent(e)
 
     def toggle_lock(self, on):
         self.locked = on
@@ -2394,6 +2630,7 @@ class Main(QMainWindow):
             self.cfg["projectors"], self.cfg["poll"] = d.projectors(), d.poll.value()
             self.cfg["iface"] = d.iface.currentData()
             self.cfg["confirm_off"], self.cfg["stagger"] = d.confirm.isChecked(), d.stagger.value()
+            self.cfg["listen"] = d.listen.isChecked()
             self.save()
             self.build()
 

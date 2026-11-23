@@ -1,6 +1,7 @@
 """Protocole série Christie HS (D16/D20-HS) sur TCP, port 3002.
 Format : (CMD) pour une commande, (CMD?) pour une requête, réponse (CMD!valeur)."""
 import re, socket, threading, time
+from collections import deque
 from contextlib import contextmanager
 
 PORT = 3002
@@ -15,6 +16,17 @@ INFO = [  # (requête, libellé)
 LSE_TEXT = {1: "la source lumineuse ne s'est pas allumée", 3: "la source lumineuse s'est éteinte de façon inattendue",
             4: "panne de ventilateur", 5: "surchauffe"}
 MSG = re.compile(r"\(([^()]*)\)")
+# Voyants d'activité : l'appli y branche des fonctions appelées à chaque envoi / réception (depuis n'importe quel thread)
+ACTIVITY = {"tx": None, "rx": None}
+
+
+def _blink(kind):
+    f = ACTIVITY.get(kind)
+    if f:
+        try:
+            f()
+        except Exception:
+            pass
 REPLY = re.compile(r"^#?([A-Za-z]{3})(?:\+([A-Za-z0-9]{4}))?!\s*(.*)$", re.S)
 
 
@@ -167,6 +179,7 @@ class Projector:
         self.lock = threading.Lock()  # une seule conversation TCP à la fois par VP
         self._tl = threading.local()
         self._urg, self._urg_lock = 0, threading.Lock()
+        self.own = deque(maxlen=512)  # (ip locale, port) de nos propres connexions : l'écoute réseau les ignore
 
     @contextmanager
     def priority(self):
@@ -191,8 +204,10 @@ class Projector:
             s = socket.create_connection((self.ip, self.port), timeout=timeout,
                                          source_address=(self.bind, 0) if self.bind else None)
             with s:
+                self.own.append(tuple(s.getsockname()[:2]))
                 for c in cmds:
                     s.sendall(f"({c})\n".encode())
+                    _blink("tx")
                     time.sleep(0.05)
                 buf, end = "", time.time() + timeout
                 s.settimeout(idle)
@@ -202,6 +217,7 @@ class Projector:
                         if not d:
                             break
                         buf += d.decode("latin-1")
+                        _blink("rx")
                     except socket.timeout:
                         if quiet or len(MSG.findall(buf)) >= want:  # quiet : pas d'accusé attendu (SET)
                             break
