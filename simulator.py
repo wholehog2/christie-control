@@ -200,7 +200,7 @@ class SimVP:
         if code == "SST":
             msgs = ['(SST+MDLN!"D20HD-HS")', '(SST+SNUM!"1234567890")', '(SST+RELV!"2.3.1")', '(SST+FWV1!"1.0.4")',
                     '(SST+FWV2!"1.0.2")', '(SST+FWV6!"3.1.2")', '(SST+FWV7!"4.2.0")', '(SST+FWV8!"1.2.0")',
-                    '(SST+XTRA!"Valeur sans catégorie connue")']
+                    '(SST+XTRA!"Valeur sans catégorie connue")', '(SST+PIPS!"PIP Mode : Off")', '(SST+TEMP!"System Temperature : 41")']
             sig = self.signal_now()
             if sig:
                 msgs.append(f'(SST+RESL!"{sig[0]}x{sig[1]}")')

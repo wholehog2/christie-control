@@ -753,6 +753,11 @@ class DataPanel(QWidget):
         txt, bad = self._lse_text(d["lse"])
         vals = self._fill(self.r1, hours + [("Dernière erreur système", txt)])
         self.lse_val = vals[-1]
+        t = d.get("temp")
+        if t:  # température système : à droite des heures, alignée à droite
+            lab = QLabel(f"{t[0]} : {pretty(t[0], t[1])}")
+            lab.setAlignment(Qt.AlignRight | Qt.AlignTop)
+            self.r1.addWidget(lab, 0, 2, Qt.AlignRight | Qt.AlignTop)
         self.set_lse(d["lse"])
         self._fill(self.r2, d["signal"])
         self._fill(self.r3, d["network"])

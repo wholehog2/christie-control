@@ -98,7 +98,7 @@ SUB_LABELS = {"MDLN": "Modèle", "SNUM": "N° de série", "NERS": "Résolution n
 
 
 LABEL_FR = {"ip address": "Adresse IP", "subnet mask": "Masque", "gateway": "Passerelle", "mac address": "Adresse MAC",
-            "primary dns": "DNS principal", "secondary dns": "DNS secondaire", "dhcp": "DHCP"}
+            "primary dns": "DNS principal", "system temperature": "Température système", "secondary dns": "DNS secondaire", "dhcp": "DHCP"}
 
 
 def clean_rows(pairs):
@@ -325,7 +325,8 @@ class Projector:
     def details(self):
         """Données rangées par catégories (voir classify) + dernière erreur + ventilateurs.
         Toutes les requêtes partent dans UNE seule conversation : rapide, et la liaison reste libre."""
-        d = {"model": "", "hours": [], "signal": [], "network": [], "versions": [], "other": [], "fans": [], "lse": None}
+        d = {"model": "", "hours": [], "signal": [], "network": [], "versions": [], "other": [], "fans": [], "lse": None,
+             "temp": None}
         seen = {c: set() for c in ("hours", "signal", "network", "versions", "other")}
         sst_signal, sig, fans = [], {}, {}
 
@@ -379,6 +380,18 @@ class Projector:
                 d["model"] = (v or "").replace('"', "").strip()
             except OSError:
                 pass
+        # PIP : retiré de l'affichage ; température système : sortie des listes (affichée à côté des heures)
+        d["temp"] = None
+        for cat in ("hours", "signal", "network", "versions", "other"):
+            keep = []
+            for label, val in d[cat]:
+                if re.search(r"(?<![a-z])pip(?![a-z])|picture.?in.?picture", label, re.I):
+                    continue
+                if d["temp"] is None and re.search(r"temp", label, re.I) and cat in ("versions", "other"):
+                    d["temp"] = (label, val)
+                    continue
+                keep.append((label, val))
+            d[cat] = keep
         d["fans"] = [_rpm(fans.get(f"FAN+FA0{i}")) for i in (1, 2, 3)]
         if None in d["fans"]:
             d["fans"] = self.fans()
