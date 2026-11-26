@@ -680,7 +680,7 @@ class DataPanel(QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        self.place(e.size().width() < 560)
+        self.place(e.size().width() < 400)
 
     @staticmethod
     def _block(title):
@@ -732,8 +732,11 @@ class DataPanel(QWidget):
             self.lse_val.setText(txt)
             self.lse_val.setStyleSheet("color:#ef4444;font-weight:700" if bad else "")
 
-    def set_fans(self, rpms):
-        for m, v in zip(self.meters, rpms):
+    def set_fans(self, rpms, keep=False):
+        """Les trois vumètres sont mis à jour d'un coup. keep=True : une mesure manquante garde l'ancienne valeur
+        (un relevé incomplet ne fait pas disparaître un ventilateur)."""
+        vals = [m.value if (v is None and keep) else v for m, v in zip(self.meters, rpms)]
+        for m, v in zip(self.meters, vals):
             m.set_value(v)
 
     def set_error(self, msg):
@@ -754,7 +757,7 @@ class DataPanel(QWidget):
         self._fill(self.r2, d["signal"])
         self._fill(self.r3, d["network"])
         self._fill(self.r4, d["versions"] + d["other"])
-        self.set_fans(d["fans"] or [None, None, None])
+        self.set_fans(d["fans"] or [None, None, None], keep=True)
 
 
 ORI = {"ceiling": ("CEL", "Au plafond"), "rear": ("SOR", "En rétro")}
@@ -2106,7 +2109,7 @@ QLabel#lcd {{ background: #09110c; color: #67f59a; border-radius: 7px; padding: 
 
     def apply_fans(self, fans, err):
         if self.data_panel is not None:
-            self.data_panel.set_fans([None, None, None] if err else fans)
+            self.data_panel.set_fans([None, None, None] if err else fans, keep=not err)
         on = self.last_st is not None and self.last_st.get("pwr") == "on"
         self.fan_check(fans if (on and not err) else None)
 

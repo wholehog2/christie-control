@@ -308,7 +308,14 @@ class Projector:
             d = dict(parse(self.ask("FAN+FA01?", "FAN+FA02?", "FAN+FA03?", timeout=1.5, want=3)))
         except OSError:
             return [None, None, None]
-        return [_rpm(d.get(f"FAN+FA0{i}")) for i in (1, 2, 3)]
+        out = [_rpm(d.get(f"FAN+FA0{i}")) for i in (1, 2, 3)]
+        for i in (1, 2, 3):  # réponse manquante : on la redemande seule, pour que les trois valeurs arrivent ensemble
+            if out[i - 1] is None:
+                try:
+                    out[i - 1] = _rpm(dict(parse(self.ask(f"FAN+FA0{i}?", timeout=1.5))).get(f"FAN+FA0{i}"))
+                except OSError:
+                    pass
+        return out
 
     def details(self):
         """Données rangées par catégories (voir classify) + dernière erreur + ventilateurs.
@@ -364,6 +371,8 @@ class Projector:
             except OSError:
                 pass
         d["fans"] = [_rpm(fans.get(f"FAN+FA0{i}")) for i in (1, 2, 3)]
+        if None in d["fans"]:
+            d["fans"] = self.fans()
         return d
 
     def info(self):
