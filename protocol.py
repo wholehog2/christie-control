@@ -97,6 +97,10 @@ SUB_LABELS = {"MDLN": "Modèle", "SNUM": "N° de série", "NERS": "Résolution n
               "VREF": "Fréquence verticale", "HREF": "Fréquence horizontale"}
 
 
+LABEL_FR = {"ip address": "Adresse IP", "subnet mask": "Masque", "gateway": "Passerelle", "mac address": "Adresse MAC",
+            "primary dns": "DNS principal", "secondary dns": "DNS secondaire", "dhcp": "DHCP"}
+
+
 def clean_rows(pairs):
     """[(clé, valeur)] -> [(clé, libellé, valeur)] : guillemets retirés, formats courants décomposés.
     « 000 2090 Total Projector Hours » -> (« Total Projector Hours », « 2090 ») ; « Libellé : valeur » ; sous-codes connus."""
@@ -118,6 +122,7 @@ def clean_rows(pairs):
             label, val = SUB_LABELS[sub], v
         else:
             label, val = key, v
+        label = LABEL_FR.get(label.strip().lower(), label)
         out.append((key, label, val))
     return out
 
@@ -334,8 +339,12 @@ class Projector:
                 d[cat].append((label, val))
         # SST? renvoie beaucoup de lignes : sa conversation à part attend la fin du flux (1 s de silence), au lieu
         # de s'arrêter dès qu'on a « assez » de messages et de perdre la fin de la liste ou les réponses suivantes.
-        msgs = self.ask("ILI?", "FVI?", "ICI?", timeout=4.0, idle=0.6, want=3)
-        msgs += self.ask("SST?", timeout=12.0, idle=1.0, want=2)
+        msgs = []
+        for c, t in (("ILI?", 5.0), ("FVI?", 5.0), ("ICI?", 6.0), ("SST?", 12.0)):  # une conversation par liste
+            got = self.ask(c, timeout=t, idle=(1.0 if c == "SST?" else 0.7), want=2)
+            if not got and c == "ICI?":  # réseau : une relecture si rien n'est arrivé
+                got = self.ask(c, timeout=t, idle=(1.0 if c == "SST?" else 0.7), want=2)
+            msgs += got
         msgs += self.ask("MIF+RESL?", "MIF+SGFT?", "MIF+VREF?", "LSE?", "FAN+FA01?", "FAN+FA02?", "FAN+FA03?",
                          timeout=4.0, idle=0.5, want=7)
         if not msgs:
