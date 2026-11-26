@@ -43,6 +43,8 @@ class SimVP:
         self.nosignal = "0x0"                        # réponse de MIF+RESL? sans signal : « 0x0 », « No Signal » ou « erreur »
         self.warm_s, self.cool_s = 25, 40
         self.lse = 0
+        self.fan_rpm = {"1": 3500, "2": 3300, "3": 3400}   # vitesse nominale (tr/min) de chaque ventilateur, réglable
+        self.fan_auto = True                               # True : la vitesse suit l'état (arrêt, allumage, refroidissement)
         self.reset(first=True)
 
     # ---------------------------------------------------------------- état
@@ -70,6 +72,17 @@ class SimVP:
             n = len(self.log)
             first = self.seq - n
             return self.seq, [(t, x) for k, (t, x) in enumerate(self.log) if first + k >= i]
+
+    def fan_now(self, k):
+        """Vitesse réellement envoyée pour le ventilateur k (« 1 », « 2 » ou « 3 »).
+        Allumé : exactement la valeur du curseur. Éteint : 0. Allumage / refroidissement : plus lent / plus rapide
+        si l'option « suit l'état » est cochée, sinon la valeur du curseur."""
+        nominal = self.fan_rpm[k]
+        if self.power == "off":
+            return 0
+        if self.fan_auto:
+            return int(nominal * {"warming": 0.7, "cooling": 1.25}.get(self.power, 1.0))
+        return nominal
 
     def signal_now(self):
         return self.res if self.power == "on" and self.signals.get(self.source) else None
@@ -193,12 +206,8 @@ class SimVP:
                 msgs.append(f'(SST+RESL!"{sig[0]}x{sig[1]}")')
             return msgs
         if code.startswith("FAN+FA0") and code[-1] in "123":
-            if self.power == "off":
-                rpm = 0
-            else:  # ~3 700 tr/min en fonctionnement, plus vite en refroidissement ; légère dépendance à la luminosité
-                base = {"warming": 2500, "cooling": 4600}.get(self.power, 3300 + self.lamp["BRT"] * 8)
-                rpm = base + {"1": 450, "2": -150, "3": 120}[code[-1]]
-            return [f'({code}!"{rpm} RPM")']
+            r = self.fan_now(code[-1])
+            return [f'({code}!"RPM:{r}, Duty:{min(99, r * 100 // 6000):03d}")']
         return [self.err(1, "Unknown command")]
 
     def write(self, code, arg, ack, raw):
@@ -340,7 +349,7 @@ def export_config(path, vps, ip="127.0.0.1"):
 def run_gui(args):
     from PySide6.QtCore import Qt, QTimer
     from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-                                   QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSpinBox,
+                                   QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSlider, QSpinBox,
                                    QVBoxLayout, QWidget)
 
     STYLE = """
@@ -351,6 +360,9 @@ def run_gui(args):
     QPushButton:hover{background:#2c3342}
     QLineEdit,QSpinBox,QComboBox,QPlainTextEdit{background:#12151b;border:1px solid #262b36;border-radius:6px;padding:4px}
     QComboBox QAbstractItemView{background:#181b22}
+    QSlider::groove:horizontal{height:4px;background:#262b36;border-radius:2px}
+    QSlider::sub-page:horizontal{background:#4f8cff;border-radius:2px}
+    QSlider::handle:horizontal{width:16px;height:16px;margin:-6px 0;border-radius:8px;background:#e6e8ee}
     """
 
     class Panel(QFrame):
@@ -442,6 +454,29 @@ def run_gui(args):
                 sp.valueChanged.connect(lambda val, a=attr: setattr(vp, a, val))
                 g.addWidget(QLabel(text), row, 0)
                 g.addWidget(sp, row, 1)
+            g.addWidget(self.cap("Ventilateurs (vitesse nominale, tr/min)"), 8, 0, 1, 2)
+            self.fan_sl, self.fan_lb = {}, {}
+            for row, k in enumerate(("1", "2", "3"), start=9):
+                sl = QSlider(Qt.Horizontal)
+                sl.setRange(0, 6000)
+                sl.setSingleStep(50)
+                sl.setPageStep(250)
+                sl.setValue(vp.fan_rpm[k])
+                lb = QLabel()
+                lb.setMinimumWidth(190)
+
+                def on_fan(val, k=k):
+                    vp.fan_rpm[k] = val
+                sl.valueChanged.connect(on_fan)
+                self.fan_sl[k] = sl
+                self.fan_lb[k] = lb
+                g.addWidget(lb, row, 0)
+                g.addWidget(sl, row, 1)
+            self.fa = QCheckBox("Allumage plus lent (×0,7) et refroidissement plus rapide (×1,25) ; allumé = valeur exacte")
+            self.fa.setChecked(False)
+            vp.fan_auto = False
+            self.fa.toggled.connect(lambda on: setattr(vp, "fan_auto", on))
+            g.addWidget(self.fa, 12, 0, 1, 2)
             self.rs = QCheckBox("Répond aux commandes par l'état (ex. (SHU!001))")
             self.rs.setChecked(True)
             self.rs.toggled.connect(lambda on: setattr(vp, "reply_state", on))
@@ -488,6 +523,8 @@ def run_gui(args):
                 f'<span style="color:#8b93a7">Shutter : <b style="color:#e6e8ee">{"fermé" if s["shutter"] else "ouvert"}</b> · '
                 f'Source : <b style="color:#e6e8ee">{INPUTS[s["source"]]}</b> · Signal : <b style="color:#e6e8ee">{sig}</b> · '
                 f'Luminosité : <b style="color:#e6e8ee">{s["lamp"]} %</b> · {orient} · Erreur : <b style="color:#e6e8ee">{LSE_CODES.get(s["lse"], s["lse"])}</b></span>')
+            for k, lb in self.fan_lb.items():  # curseur et valeur réellement envoyée au projecteur
+                lb.setText(f"FAN {k} : {vp.fan_rpm[k]} → envoyé {vp.fan_now(k)}")
             self.seen, lines = vp.log_since(self.seen)
             for t, x in lines:
                 self.logv.appendPlainText(f"{time.strftime('%H:%M:%S', time.localtime(t))}  {x}")

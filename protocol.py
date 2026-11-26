@@ -16,6 +16,15 @@ INFO = [  # (requête, libellé)
 LSE_TEXT = {1: "la source lumineuse ne s'est pas allumée", 3: "la source lumineuse s'est éteinte de façon inattendue",
             4: "panne de ventilateur", 5: "surchauffe"}
 MSG = re.compile(r"\(([^()]*)\)")
+# Réponse complète, même si la valeur contient des parenthèses : « (ILI!000 2090 "Heures (total)") ».
+# Un message se termine par « ) » suivi d'un saut de ligne, d'un autre « ( » ou de la fin des données.
+MSG_FULL = re.compile(r"\(\s*([#A-Za-z]{3}.*?)\)(?=\s*(?:\(|\Z))", re.S)
+
+
+def split_msgs(buf):
+    """Texte reçu -> liste de messages sans les parenthèses extérieures (valeurs avec parenthèses comprises)."""
+    out = [m.strip() for m in MSG_FULL.findall(buf)]
+    return out if out else [m.strip() for m in MSG.findall(buf)]
 # Voyants d'activité : l'appli y branche des fonctions appelées à chaque envoi / réception (depuis n'importe quel thread)
 ACTIVITY = {"tx": None, "rx": None}
 
@@ -137,6 +146,9 @@ def _rpm(v):
     if v is None:
         return None
     s = re.sub(r"(?<=\d)[ \u00a0](?=\d{3}\b)", "", str(v).replace('"', ""))  # « 4 210 » -> « 4210 »
+    m = re.search(r"rpm\s*[:=]\s*(\d+(?:[.,]\d+)?)", s, re.I)  # réponse réelle : « RPM:2313, Duty:064 »
+    if m:
+        return int(float(m[1].replace(",", ".")))
     m = re.search(r"(\d+(?:[.,]\d+)?)\s*rpm", s, re.I)
     if m:
         return int(float(m[1].replace(",", ".")))
@@ -219,9 +231,9 @@ class Projector:
                         buf += d.decode("latin-1")
                         _blink("rx")
                     except socket.timeout:
-                        if quiet or len(MSG.findall(buf)) >= want:  # quiet : pas d'accusé attendu (SET)
+                        if quiet or len(split_msgs(buf)) >= want:  # quiet : pas d'accusé attendu (SET)
                             break
-        return [m.strip() for m in MSG.findall(buf)]
+        return split_msgs(buf)
 
     def _get(self, cmd, key):
         return dict(parse(self.ask(cmd))).get(key)
@@ -309,14 +321,21 @@ class Projector:
             if cat == "model":
                 d["model"] = d["model"] or val
                 return
-            k = re.sub(r"\W", "", label.lower())
+            k = re.sub(r"\W", "", label.lower()) + ("" if label != "Réponse brute" else val)
             if k not in seen[cat]:
                 seen[cat].add(k)
                 d[cat].append((label, val))
-        cmds = ["ILI?", "FVI?", "ICI?", "SST?", "MIF+RESL?", "MIF+SGFT?", "MIF+VREF?", "LSE?", "FAN+FA01?", "FAN+FA02?", "FAN+FA03?"]
-        msgs = self.ask(*cmds, timeout=4.0, idle=0.5, want=len(cmds))
+        # SST? renvoie beaucoup de lignes : sa conversation à part attend la fin du flux (1 s de silence), au lieu
+        # de s'arrêter dès qu'on a « assez » de messages et de perdre la fin de la liste ou les réponses suivantes.
+        msgs = self.ask("ILI?", "FVI?", "ICI?", timeout=4.0, idle=0.6, want=3)
+        msgs += self.ask("SST?", timeout=12.0, idle=1.0, want=2)
+        msgs += self.ask("MIF+RESL?", "MIF+SGFT?", "MIF+VREF?", "LSE?", "FAN+FA01?", "FAN+FA02?", "FAN+FA03?",
+                         timeout=4.0, idle=0.5, want=7)
         if not msgs:
             raise OSError("aucune réponse du projecteur")
+        for m in msgs:  # réponse d'un format inattendu : on l'affiche quand même au lieu de la perdre
+            if not REPLY.match(m) and "ERR" not in m:
+                add("other", "Réponse brute", m)
         for key, label, val in clean_rows(parse(msgs)):
             head = key.split("+")[0]
             if head == "LSE":
