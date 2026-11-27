@@ -211,8 +211,10 @@ class Projector:
             with self._urg_lock:
                 self._urg -= 1
 
-    def ask(self, *cmds, timeout=3.0, idle=0.25, quiet=False, want=1):
-        """Envoie des commandes, renvoie la liste des messages reçus (sans parenthèses)."""
+    def ask(self, *cmds, timeout=3.0, idle=0.25, quiet=False, want=1, until=None, gap=0.05):
+        """Envoie des commandes, renvoie la liste des messages reçus (sans parenthèses).
+        until : préfixe de la réponse de la DERNIÈRE commande. Le VP répond dans l'ordre : dès qu'elle arrive, tout est
+        reçu et on s'arrête tout de suite, sans attendre un silence (sinon on retombe sur idle / want)."""
         if not getattr(self._tl, "on", False):  # lecture de fond : on laisse passer les actions de l'utilisateur
             t0 = time.time()
             while self._urg and time.time() - t0 < 6.0:
@@ -225,7 +227,7 @@ class Projector:
                 for c in cmds:
                     s.sendall(f"({c})\n".encode())
                     _blink("tx")
-                    time.sleep(0.05)
+                    time.sleep(gap)
                 buf, end = "", time.time() + timeout
                 s.settimeout(idle)
                 while time.time() < end:
@@ -235,6 +237,8 @@ class Projector:
                             break
                         buf += d.decode("latin-1")
                         _blink("rx")
+                        if until and any(m.startswith(until) for m in split_msgs(buf)):
+                            break
                     except socket.timeout:
                         if quiet or len(split_msgs(buf)) >= want:  # quiet : pas d'accusé attendu (SET)
                             break
@@ -340,14 +344,12 @@ class Projector:
                 d[cat].append((label, val))
         # SST? renvoie beaucoup de lignes : sa conversation à part attend la fin du flux (1 s de silence), au lieu
         # de s'arrêter dès qu'on a « assez » de messages et de perdre la fin de la liste ou les réponses suivantes.
-        msgs = []
-        for c, t in (("ILI?", 5.0), ("FVI?", 5.0), ("ICI?", 6.0), ("SST?", 12.0)):  # une conversation par liste
-            got = self.ask(c, timeout=t, idle=(1.0 if c == "SST?" else 0.7), want=2)
-            if not got and c == "ICI?":  # réseau : une relecture si rien n'est arrivé
-                got = self.ask(c, timeout=t, idle=(1.0 if c == "SST?" else 0.7), want=2)
-            msgs += got
-        msgs += self.ask("MIF+RESL?", "MIF+SGFT?", "MIF+VREF?", "LSE?", "FAN+FA01?", "FAN+FA02?", "FAN+FA03?",
-                         timeout=4.0, idle=0.5, want=7)
+        cmds = ["ILI?", "FVI?", "ICI?", "SST?", "MIF+RESL?", "MIF+SGFT?", "MIF+VREF?", "LSE?",
+                "FAN+FA01?", "FAN+FA02?", "FAN+FA03?"]
+        # Une seule conversation, sans attente : la dernière réponse (FAN+FA03) signale que tout est arrivé.
+        msgs = self.ask(*cmds, timeout=10.0, idle=1.0, want=len(cmds), until="FAN+FA03", gap=0.02)
+        if not any(m.startswith("ICI") for m in msgs):  # réseau absent : une relecture
+            msgs += self.ask("ICI?", timeout=4.0, idle=0.7, want=2)
         if not msgs:
             raise OSError("aucune réponse du projecteur")
         for m in msgs:  # réponse d'un format inattendu : on l'affiche quand même au lieu de la perdre
